@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 Orchestrator for Spectral Complexity and Continuous Change Detection.
 
@@ -59,33 +58,22 @@ def load_pipeline_config(config_path: Optional[str] = None, location: Optional[s
     """
     Loads location and pipeline configuration YAML file with fallback hierarchy.
     """
-    config_file = Path(config_path) if config_path else Path(__file__).resolve().parent / "locations_config.yaml"
-    config_data = None
-
-    if config_file.exists():
-        try:
-            with open(config_file, "r", encoding="utf-8") as f:
-                config_data = yaml.safe_load(f)
-        except Exception:
-            pass
-
-    if config_data is None:
-        # Fallback default configuration for Rochesterv2 baseline
-        config_data = {
-            "current_run": {"location": "Rochesterv2"},
-            "locations": {
-                "Rochesterv2": {
-                    "SOURCE_CACHE": None,
-                    "ROI_LON_MIN": -77.770166,
-                    "ROI_LON_MAX": -77.376776,
-                    "ROI_LAT_MIN": 42.961778,
-                    "ROI_LAT_MAX": 43.342135,
-                    "START_DATE": "2015-01-01",
-                    "END_DATE": "2026-06-01",
-                    "TANAGER_AVAILABLE": True,
-                }
+    # Fallback default configuration for Rochesterv2 baseline
+    config_data = {
+        "current_run": {"location": "Rochesterv2"},
+        "locations": {
+            "Rochesterv2": {
+                "SOURCE_CACHE": None,
+                "ROI_LON_MIN": -77.770166,
+                "ROI_LON_MAX": -77.376776,
+                "ROI_LAT_MIN": 42.961778,
+                "ROI_LAT_MAX": 43.342135,
+                "START_DATE": "2015-01-01",
+                "END_DATE": "2026-06-01",
+                "TANAGER_AVAILABLE": True,
             }
         }
+    }
 
     return config_data
 
@@ -202,7 +190,6 @@ def run_pipeline(
             ccd_res_h5 = ccd_mod.main(
                 location=location,
                 h5_path=master_h5,
-                launch_vis=False,
             )
             pipeline_state["artifacts"]["ccd_output_h5"] = ccd_res_h5
             print(f"Step 5 Complete: CCD results saved directly to {ccd_res_h5}")
@@ -216,7 +203,7 @@ def run_pipeline(
             vis_mod.plot_spatial_anomaly_overlay(
                 source_h5_path=master_h5,
                 output_png=out_png,
-                interactive=False,
+                interactive=True,
             )
             pipeline_state["artifacts"]["diagnostic_png"] = out_png
             print(f"Step 6 Complete: Diagnostic map saved to {out_png}")

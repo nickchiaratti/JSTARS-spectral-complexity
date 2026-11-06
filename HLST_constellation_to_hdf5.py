@@ -86,7 +86,7 @@ L30_SR_WAVELENGTHS = [0.443, 0.482, 0.561, 0.655, 0.865, 1.609, 2.201]
 
 
 # =====================================================================
-# INLINE HELPER FUNCTIONS (R7 Isolation: No SpecComplex or Torch)
+# INLINE HELPER FUNCTIONS
 # =====================================================================
 
 def get_hls_mask(
@@ -1185,7 +1185,7 @@ def load_locations_config(config_path=None):
 def main(target_location=None, input_native_h5=None, tanager_source_dir=None, output_master_h5=None, config_override=None):
     """
     Executes Albers Equal Area orthorectification and constellation harmonization.
-    Produces the base HLST_{Location}_Harmonized.h5 file.
+    Produces the base HLST_{Location}.h5 file.
     """
     if config_override is not None:
         config_data = config_override
@@ -1220,7 +1220,7 @@ def main(target_location=None, input_native_h5=None, tanager_source_dir=None, ou
     output_dir = "C:/satelliteImagery/HLST30/"
 
     native_h5 = input_native_h5 or os.path.join(hls_source_dir, f"HLS_{location}_STAC_Native_2025.h5")
-    master_h5 = output_master_h5 or os.path.join(output_dir, f"HLST_{location}_Harmonized.h5")
+    master_h5 = output_master_h5 or os.path.join(output_dir, f"HLST_{location}.h5")
     os.makedirs(os.path.dirname(os.path.abspath(master_h5)), exist_ok=True)
 
     print(f"Building Multi-Sensor Harmonized ARD Cube: {master_h5}")

@@ -32,14 +32,6 @@ DOWNLOAD_JOBS = [
         "include_bboxes": [REGIONS["Rochester_NY"]],
         "exclude_bboxes": [],
         "target_assets": ['basic_sr_hdf5']
-    },
-    {
-        "job_name": "CentralGreece",
-        "collection_url": "https://www.planet.com/data/stac/tanager-core-imagery/coastal-water-bodies/collection.json",
-        "output_dir": r"C:\satelliteImagery\Tanager\CentralGreece_SourceData",
-        "include_bboxes": [REGIONS["CentralGreece"]],
-        "exclude_bboxes": [REGIONS["Utah"]],
-        "target_assets": ['basic_sr_hdf5']
     }
 ]
 

@@ -382,7 +382,7 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
             sensor_dsets[grid_name]['idx'][t_local, ...] = em_idx
             sensor_dsets[grid_name]['vol'][t_local, ...] = scale_to_int16(vol_curve)
 
-            slide_map = sc.process_volume_sliding_tile(frame_sr, tile_size=tile_size, stride=1, num_endmembers=3)
+            slide_map = sc.process_volume_sliding_tile(frame_sr, tile_size=tile_size, stride=1, num_endmembers=num_endmembers)
             ds_harm_slide[global_idx, ...] = scale_to_int16(slide_map)
 
             valid_mask = (frame_mask == 0)
@@ -479,7 +479,7 @@ def main(target_location=None, tile_size=3, num_endmembers=7, norm_param=None):
                 location = None
 
         if location:
-            file_path = f"C:/satelliteImagery/HLST30/HLST_{location}_Harmonized.h5"
+            file_path = f"C:/satelliteImagery/HLST30/HLST_{location}.h5"
 
     if not file_path or not os.path.exists(file_path):
         try:

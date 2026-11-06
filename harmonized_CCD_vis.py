@@ -1,11 +1,5 @@
 """
 Harmonized Continuous Change Detection (CCD) Visualization & Diagnostic Analysis.
-
-Ports interactive and non-interactive CCD visualization routines from commit c7d149a3e99d995962bfc6d5839e87d2d3ec75f6.
-Inlines read_scaled_int16.
-Uses SpecComplexTorch.maximumDistance_volumes exclusively for patch analysis.
-Supports non-interactive figure generation saving diagnostic PNG maps.
-Zero direct imports of torch or legacy SpecComplex.
 """
 
 import os
@@ -26,12 +20,6 @@ from datetime import datetime, timezone
 import pyproj
 from scipy.stats import chi2
 from scipy.optimize import linear_sum_assignment
-
-try:
-    import scienceplots
-    plt.style.use(['science', 'no-latex'])
-except Exception:
-    pass
 
 from harmonized_CCD_main import (
     LOCATION, H5_PATH, ENABLE_CONSTANT, ENABLE_LINEAR, ENABLE_QUADRATIC,
@@ -386,7 +374,7 @@ def plot_spatial_anomaly_overlay(source_h5_path, output_png=None, interactive=Tr
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Run Harmonized CCD Visualization")
-    parser.add_argument('--source-h5', type=str, default="C:/satelliteImagery/HLST30/HLST_Rochesterv2_Harmonized.h5", help="Path to source harmonized HDF5")
+    parser.add_argument('--source-h5', type=str, default="C:/satelliteImagery/HLST30/HLST_Rochesterv2.h5", help="Path to source harmonized HDF5")
     parser.add_argument('--output-png', type=str, default=False, help="Path to save diagnostic PNG map")
     parser.add_argument('--no-gui', action='store_true', help="Run in non-interactive batch mode")
     args = parser.parse_args()

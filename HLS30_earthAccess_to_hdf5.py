@@ -25,13 +25,6 @@ import earthaccess
 import yaml
 import hdfeos_odl
 
-# Add parent folder and dev repo to sys.path to find hdfeos_odl
-script_dir = Path(__file__).resolve().parent
-if str(script_dir) not in sys.path:
-    sys.path.insert(0, str(script_dir))
-if str(script_dir.parent) not in sys.path:
-    sys.path.insert(0, str(script_dir.parent))
-
 LOCATION_DEFAULT = "Rochesterv2"
 DEFAULT_START_DATE = "2022-01-01"
 DEFAULT_END_DATE = "2026-06-01"

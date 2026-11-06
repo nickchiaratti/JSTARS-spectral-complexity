@@ -1,11 +1,5 @@
 """
 Harmonized Continuous Change Detection (CCD) Pipeline.
-
-Ports continuous change detection harmonic regression modeling using LassoLarsIC
-and Recursive Least Squares (RLS) from commit c7d149a3e99d995962bfc6d5839e87d2d3ec75f6.
-Maintains pre-MGRS coordinate reference and dataset handling matching the Albers grid.
-Inlines read_scaled_int16.
-Zero imports of torch or legacy SpecComplex.
 """
 
 import os
@@ -20,6 +14,10 @@ import joblib
 import contextlib
 from scipy.stats import chi2
 from joblib import Parallel, delayed
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=RuntimeWarning)
+    lasso_model.fit(X_train, Y_train)
 
 
 @contextlib.contextmanager
@@ -358,7 +356,6 @@ def main(enable_const=ENABLE_CONSTANT,
          enable_quad=ENABLE_QUADRATIC,
          temporal_periods=None,
          target_metric=TARGET_METRIC,
-         launch_vis=True,
          location=LOCATION,
          h5_path=None,
          output_h5=None,
@@ -373,17 +370,10 @@ def main(enable_const=ENABLE_CONSTANT,
     min_samples = MIN_SAMPLES
 
     if h5_path is None:
-        h5_path = resolve_h5_input(location=location, h5_path=H5_PATH)
-
-    _term_str = f"C{int(enable_const)}L{int(enable_lin)}Q{int(enable_quad)}"
-    _period_str = f"P{len(temporal_periods)}"
+        raise RuntimeError("No input HDF5 file provided.")
 
     if output_h5 is None:
-        output_dir = "C:/satelliteImagery/HLST30/CCD"
-        output_h5 = os.path.join(
-            output_dir,
-            f"{location}_CCD_Harmonized_Change_Detection_{target_metric}_{_term_str}_{_period_str}.h5"
-        )
+        output_h5 = h5_path
 
     print(f"Loading data from {h5_path}...")
     with h5py.File(h5_path, 'r') as f:
@@ -488,8 +478,8 @@ def main(enable_const=ENABLE_CONSTANT,
             change_date_map[y_start:y_end, :] = c_date
             change_count_map[y_start:y_end, :] = c_count
 
-    print(f"\nSaving Results directly to {h5_path}...")
-    with h5py.File(h5_path, 'a') as out_file:
+    print(f"\nSaving Results directly to {output_h5}...")
+    with h5py.File(output_h5, 'a') as out_file:
         if 'CCD_Results' in out_file:
             del out_file['CCD_Results']
         ccd_grp = out_file.create_group('CCD_Results')
@@ -521,18 +511,7 @@ def main(enable_const=ENABLE_CONSTANT,
         ccd_grp.create_dataset('change_count', data=change_count_map, shuffle=True, compression='gzip', compression_opts=6)
 
     print("Harmonized CCD Pipeline Complete!")
-
-    if launch_vis:
-        print("\nLaunching visualization...")
-        try:
-            from harmonized_CCD_vis import plot_spatial_anomaly_overlay
-            plot_spatial_anomaly_overlay(h5_path)
-        except ImportError as e:
-            print(f"Could not import visualization module: {e}")
-        except Exception as e:
-            print(f"An error occurred while launching visualization: {e}")
-
-    return h5_path
+    return output_h5
 
 
 if __name__ == "__main__":

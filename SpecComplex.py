@@ -1,9 +1,10 @@
 import os
 import math
+import warnings
+from warnings import simplefilter
 import numpy as np
 from scipy import ndimage
 from scipy.ndimage import uniform_filter
-from warnings import simplefilter
 
 
 def maximumDistance(data, num_endmembers, chunk_size=50000):
@@ -152,8 +153,13 @@ def process_volume_sliding_tile(frame_data, tile_size, stride, num_endmembers):
             if np.isnan(tile).any():
                 continue
                 
-            tile_flat = np.reshape(tile, (tile_size * tile_size, bands), order="F").T
-            endmembers, volumes = maximumDistance_volumes(tile_flat, num_endmembers)
+            endmembers, _ = maximumDistance(tile, num_endmembers)
+
+            minimum_endmember = endmembers[:, 1] #selecting the normalization translation vector
+            remaining_endmembers = np.delete(endmembers, 1, axis=1) # removing the normalization factor
+            volumes = calcGramLocalVolumes(remaining_endmembers, minimum_endmember)
+            volumes = np.insert(volumes,0,0.0) # correcting the volume indexing
+
             
             if len(volumes) > 2:
                 vol_val = np.max(volumes[2:])
