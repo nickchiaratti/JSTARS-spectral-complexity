@@ -426,7 +426,7 @@ def compare_sc_vs_pyccd(
     elif injected and group_name == GROUP_NAME:
         group_name = 'INJECTED_PYCCD_Results'
 
-    from harmonized_CCD_vis import plot_pixel_sits as plot_sc_sits
+    from SC_CCM_vis import plot_pixel_sits as plot_sc_sits
 
     fig, (ax_sc, ax_ccd) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
 

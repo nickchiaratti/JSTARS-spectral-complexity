@@ -21,7 +21,7 @@ import pyproj
 from scipy.stats import chi2
 from scipy.optimize import linear_sum_assignment
 
-from harmonized_CCD_main import (
+from SC_CCM_main import (
     LOCATION, H5_PATH, ENABLE_CONSTANT, ENABLE_LINEAR, ENABLE_QUADRATIC,
     TEMPORAL_PERIODS, TARGET_METRIC, TARGET_NAME
 )

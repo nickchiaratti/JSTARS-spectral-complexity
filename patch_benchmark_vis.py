@@ -51,7 +51,7 @@ if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 # Import core modules
-import harmonized_CCD_main as hccd
+import SC_CCM_main as hccd
 import pyccd_landsat_main as pccd
 import ccd
 

@@ -9,8 +9,8 @@ Serializes the 7-step processing chain:
     Step 3: HLST_constellation_to_hdf5 (Albers Orthorectification & Harmonization)
     Step 4: HLST_SC_calculations (Spectral Complexity)
     Step 5: pyccd_landsat_main (USGS LCMAP Landsat Temporal Regression)
-    Step 6: harmonized_CCD_main (Harmonized Continuous Change Detection)
-    Step 7: harmonized_CCD_vis (Continuous Change Detection Spatial Visualization)
+    Step 6: SC_CCM_main (Harmonized Continuous Change Detection)
+    Step 7: SC_CCM_vis (Continuous Change Detection Spatial Visualization)
 
 CLI Usage Examples:
     # Run full end-to-end baseline pipeline (Steps 1-7):
@@ -18,10 +18,7 @@ CLI Usage Examples:
 
     # Run specific step range:
     python HarmonizedSC_run_pipeline.py --steps 1-4
-    python HarmonizedSC_run_pipeline.py --steps 5-7
-
-    # Run change detection with optional injected data if present:
-    python HarmonizedSC_run_pipeline.py --steps 5-7 --injected
+    python HarmonizedSC_run_pipeline.py --steps 5
 """
 
 import os
@@ -68,15 +65,15 @@ STEP_DEFINITIONS = {
         "pipeline": "baseline",
     },
     6: {
-        "name": "harmonized_CCD_main",
+        "name": "SC_CCM_main",
         "description": "Harmonized Continuous Change Detection on SC Z-Score",
-        "module": "harmonized_CCD_main",
+        "module": "SC_CCM_main",
         "pipeline": "baseline",
     },
     7: {
-        "name": "harmonized_CCD_vis",
+        "name": "SC_CCM_vis",
         "description": "Continuous Change Detection Spatial Visualization and Diagnostic Maps",
-        "module": "harmonized_CCD_vis",
+        "module": "SC_CCM_vis",
         "pipeline": "baseline",
     },
 }
@@ -410,7 +407,7 @@ def run_pipeline(
                     f"No master HDF5 container available for Step 6. "
                     f"Run Step 3 first or specify an existing container with --h5-path (checked: {candidate_paths})."
                 )
-            ccd_mod = importlib.import_module("harmonized_CCD_main")
+            ccd_mod = importlib.import_module("SC_CCM_main")
 
             print(f"  Running Harmonized CCD on Spectral Complexity Z-Score (injected={use_injected})...")
             ccd_mod.main(
@@ -428,7 +425,7 @@ def run_pipeline(
                     f"No master HDF5 container available for Step 7. "
                     f"Run Step 3 first or specify an existing container with --h5-path (checked: {candidate_paths})."
                 )
-            vis_mod = importlib.import_module("harmonized_CCD_vis")
+            vis_mod = importlib.import_module("SC_CCM_vis")
             pyccd_vis_mod = importlib.import_module("pyccd_landsat_vis")
             diag_pngs = []
 
@@ -488,8 +485,8 @@ Step Reference:
   3: HLST_constellation_to_hdf5      Albers Orthorectification & Harmonization
   4: HLST_SC_calculations            Spectral Complexity
   5: pyccd_landsat_main              USGS LCMAP Landsat Temporal Regression
-  6: harmonized_CCD_main             Harmonized Continuous Change Detection
-  7: harmonized_CCD_vis              Continuous Change Detection Visualizations
+  6: SC_CCM_main                     Harmonized Continuous Change Detection
+  7: SC_CCM_vis                      Continuous Change Detection Visualizations
         """,
     )
     parser.add_argument(

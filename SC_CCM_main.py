@@ -14,11 +14,16 @@ import datetime
 import math
 from tqdm import tqdm
 from sklearn.linear_model import LassoLarsIC
+from sklearn.linear_model._least_angle import _lars_path_solver
 import multiprocessing
 import joblib
 import contextlib
 from scipy.stats import chi2
 from joblib import Parallel, delayed
+import numba as nb
+_HAVE_NUMBA = True
+_njit_opt = nb.njit(fastmath=True)
+
 
 
 
@@ -229,6 +234,60 @@ def extract_fractional_years(acq_times):
     return np.array(frac_years)
 
 
+def fast_lasso_lars_bic(X, y):
+    """
+    Lightweight, exact drop-in replacement for LassoLarsIC(criterion='bic', fit_intercept=True).
+    Bypasses scikit-learn estimator overhead, input validation, and redundant copying.
+
+    Returns:
+        coef: ndarray of shape (n_features,)
+        intercept: float
+        y_pred: ndarray of shape (n_samples,)
+        active_features: ndarray of active feature indices
+    """
+    n_samples, n_features = X.shape
+
+    # 1. Center X and y (equivalent to fit_intercept=True)
+    X_mean = np.mean(X, axis=0)
+    y_mean = np.mean(y)
+    X_c = X - X_mean
+    y_c = y - y_mean
+
+    # 2. Estimate unpenalized noise variance via OLS on centered variables
+    coef_ols, _, _, _ = np.linalg.lstsq(X_c, y_c, rcond=None)
+    residuals_ols = y_c - X_c @ coef_ols
+    dof_noise = max(1, n_samples - n_features - 1)
+    noise_variance = np.sum(residuals_ols**2) / dof_noise
+    noise_variance = max(noise_variance, 1e-12)
+
+    # 3. Compute LARS path directly via the compiled solver
+    alphas, _, coef_path = _lars_path_solver(
+        X=X_c, y=y_c, method='lasso', copy_X=True, return_path=True
+    )
+
+    # 4. Evaluate BIC criterion across the regularization path
+    residuals = y_c[:, np.newaxis] - X_c @ coef_path
+    rss = np.sum(residuals**2, axis=0)
+
+    eps = np.finfo(coef_path.dtype).eps
+    dof = np.sum(np.abs(coef_path) > eps, axis=0)
+
+    bic_criterion = (
+        n_samples * np.log(2.0 * np.pi * noise_variance)
+        + rss / noise_variance
+        + np.log(n_samples) * dof
+    )
+
+    # 5. Extract optimal model
+    best_idx = np.argmin(bic_criterion)
+    coef = coef_path[:, best_idx]
+    intercept = y_mean - np.dot(X_mean, coef)
+    y_pred = X @ coef + intercept
+    active_features = np.where(np.abs(coef) > eps)[0]
+
+    return coef, intercept, y_pred, active_features
+
+
 def build_harmonic_matrix(t, temporal_periods=None,
                           enable_const=ENABLE_CONSTANT,
                           enable_lin=ENABLE_LINEAR,
@@ -257,6 +316,192 @@ def build_harmonic_matrix(t, temporal_periods=None,
     return np.column_stack(cols) if cols else np.zeros((len(t), 0))
 
 
+@_njit_opt
+def backfill_init_window_numba(
+    valid_indices, segment_start_idx, train_end,
+    X_full, theta, rmse,
+    chunk_pred, chunk_rmse, chunk_coef,
+    y_local, x
+):
+    """JIT-compiled backfill of model predictions across the initialization window."""
+    num_features = len(theta)
+    for k in range(segment_start_idx, train_end):
+        global_idx = valid_indices[k]
+        y_pred = 0.0
+        for f in range(num_features):
+            y_pred += X_full[global_idx, f] * theta[f]
+            chunk_coef[global_idx, y_local, x, f] = np.float32(theta[f])
+        chunk_pred[global_idx, y_local, x] = np.float32(y_pred)
+        chunk_rmse[global_idx, y_local, x] = np.float32(rmse)
+
+
+@_njit_opt
+def rls_forward_pass_numba(
+    valid_indices, train_end, y_series, X_full,
+    theta_in, P_in, rmse, SSE_in, dof, n_points_in,
+    chi2_threshold, consec_anom, forgetting_factor,
+    chunk_pred, chunk_rmse, chunk_coef, chunk_flags,
+    y_local, x
+):
+    """
+    JIT-compiled forward expanding RLS pass for a single pixel time series.
+    Eliminates all Python interpreter and temporary array allocation overhead.
+    """
+    num_features = len(theta_in)
+    theta = theta_in.copy()
+    P = P_in.copy()
+    SSE = SSE_in
+    n_points = n_points_in
+    consecutive_count = 0
+    break_detected = False
+    first_anomaly_idx = -1
+    target_j = train_end - 1
+
+    n_valid = len(valid_indices)
+    Px = np.zeros(num_features, dtype=np.float64)
+    K = np.zeros(num_features, dtype=np.float64)
+    inv_ff = 1.0 / forgetting_factor
+
+    for j in range(train_end, n_valid):
+        target_j = j
+        target_idx = valid_indices[j]
+        actual = y_series[target_idx]
+
+        y_pred = 0.0
+        for f in range(num_features):
+            y_pred += X_full[target_idx, f] * theta[f]
+
+        error = abs(actual - y_pred)
+
+        chunk_pred[target_idx, y_local, x] = np.float32(y_pred)
+        chunk_rmse[target_idx, y_local, x] = np.float32(rmse)
+        for f in range(num_features):
+            chunk_coef[target_idx, y_local, x, f] = np.float32(theta[f])
+
+        chi2_val = (error / rmse) ** 2
+        is_anomaly = chi2_val > chi2_threshold
+
+        if is_anomaly:
+            chunk_flags[target_idx, y_local, x] = np.uint8(1)
+            consecutive_count += 1
+            if consecutive_count >= consec_anom:
+                first_anomaly_idx = valid_indices[j - consec_anom + 1]
+                break_detected = True
+                break
+        else:
+            consecutive_count = 0
+            xTx = 0.0
+            for r in range(num_features):
+                val = 0.0
+                for c in range(num_features):
+                    val += P[r, c] * X_full[target_idx, c]
+                Px[r] = val
+                xTx += X_full[target_idx, r] * val
+
+            denom = forgetting_factor + xTx
+            inv_denom = 1.0 / denom
+            for f in range(num_features):
+                K[f] = Px[f] * inv_denom
+
+            e = actual - y_pred
+            for f in range(num_features):
+                theta[f] += K[f] * e
+
+            for r in range(num_features):
+                for c in range(num_features):
+                    P[r, c] = (P[r, c] - K[r] * Px[c]) * inv_ff
+
+            SSE += (e * e) * inv_denom
+            n_points += 1
+
+    return break_detected, target_j, first_anomaly_idx, theta, P, SSE, n_points
+
+
+def rls_forward_pass_batched(
+    y_batch, X_full, valid_indices, train_end,
+    thetas_init, P_matrices_init, rmses,
+    chi2_threshold, consec_anom, forgetting_factor=0.999
+):
+    """
+    Batched RLS forward pass across multiple pixels sharing identical observation indices.
+    Vectorizes matrix-vector operations across all pixels simultaneously using @ and np.einsum.
+
+    Parameters:
+        y_batch: ndarray of shape (num_frames, batch_size)
+        X_full: ndarray of shape (num_frames, num_features)
+        valid_indices: 1D array of valid time frame indices
+        train_end: index in valid_indices where forward expansion begins
+        thetas_init: ndarray of shape (batch_size, num_features)
+        P_matrices_init: ndarray of shape (batch_size, num_features, num_features)
+        rmses: ndarray of shape (batch_size,)
+        chi2_threshold: float threshold for chi2 anomaly check
+        consec_anom: consecutive anomaly count to confirm break
+        forgetting_factor: RLS lambda parameter
+
+    Returns:
+        preds: ndarray of shape (num_frames, batch_size)
+        anomalies: ndarray of shape (num_frames, batch_size)
+        thetas: updated parameter vectors (batch_size, num_features)
+        P_matrices: updated covariance matrices (batch_size, num_features, num_features)
+        break_indices: 1D array of length batch_size (or -1 if no break)
+    """
+    num_frames, batch_size = y_batch.shape
+
+    thetas = thetas_init.copy()
+    P = P_matrices_init.copy()
+    consec = np.zeros(batch_size, dtype=np.int32)
+    active = np.ones(batch_size, dtype=bool)
+    break_indices = np.full(batch_size, -1, dtype=np.int32)
+
+    preds = np.full((num_frames, batch_size), np.nan, dtype=np.float32)
+    anomalies = np.zeros((num_frames, batch_size), dtype=np.uint8)
+
+    inv_ff = 1.0 / forgetting_factor
+
+    for j in range(train_end, len(valid_indices)):
+        if not np.any(active):
+            break
+
+        idx = valid_indices[j]
+        x_t = X_full[idx, :]
+
+        # Batched prediction: (M, K) @ (K,) -> (M,)
+        y_pred = thetas @ x_t
+        preds[idx, :] = y_pred
+
+        actual = y_batch[idx, :]
+        error = np.abs(actual - y_pred)
+        chi2_vals = (error / rmses) ** 2
+
+        is_anom = (chi2_vals > chi2_threshold) & active
+        anomalies[idx, is_anom] = 1
+
+        consec[is_anom] += 1
+        new_breaks = (consec >= consec_anom) & active
+        if np.any(new_breaks):
+            break_indices[new_breaks] = valid_indices[j - consec_anom + 1]
+            active[new_breaks] = False
+
+        non_anom = (~is_anom) & active
+        consec[non_anom] = 0
+
+        if not np.any(non_anom):
+            continue
+
+        P_act = P[non_anom]
+        Px = P_act @ x_t
+        denom = forgetting_factor + (Px @ x_t)
+        K_gain = Px / denom[:, None]
+
+        e = actual[non_anom] - y_pred[non_anom]
+        thetas[non_anom] += K_gain * e[:, None]
+
+        P_act = (P_act - np.einsum('ni,nj->nij', K_gain, Px)) * inv_ff
+        P[non_anom] = P_act
+
+    return preds, anomalies, thetas, P, break_indices
+
+
 def _process_row_chunk(chunk_args):
     """Worker function for processing a row chunk across temporal frames."""
     (y_start, y_end, width, y_data_chunk, valid_mask_chunk,
@@ -272,6 +517,7 @@ def _process_row_chunk(chunk_args):
     chunk_flags = np.zeros((num_frames, chunk_height, width), dtype=np.uint8)
     chunk_date = np.full((chunk_height, width), np.nan, dtype=np.float64)
     chunk_count = np.zeros((chunk_height, width), dtype=np.int32)
+    chunk_segments = {}
 
     chi2_threshold = chi2.ppf(change_prob, df=CHI2_DEGREES_OF_FREEDOM)
 
@@ -283,6 +529,8 @@ def _process_row_chunk(chunk_args):
             if len(valid_indices) <= min_samples:
                 continue
 
+            pixel_segments = []
+            seg_counter = 0
             i = 0
             while i < len(valid_indices) - min_samples:
                 # 1. Initialize segment
@@ -305,29 +553,29 @@ def _process_row_chunk(chunk_args):
                 absolute_min_samples = max(min_dof, min_samples)
 
                 initialization_successful = False
-                lasso_model = LassoLarsIC(criterion='bic', fit_intercept=True)
+                last_active_features = None
 
                 while len(active_pool) >= absolute_min_samples:
                     X_train = X_full[valid_indices[active_pool], :]
                     Y_train = y_data_chunk[valid_indices[active_pool], y_local, x]
 
                     try:
-                        lasso_model.fit(X_train, Y_train)
-                        y_train_pred = lasso_model.predict(X_train)
+                        coef, intercept, y_train_pred, active_features = fast_lasso_lars_bic(X_train, Y_train)
                         rmse = np.sqrt(np.mean((Y_train - y_train_pred)**2))
                         rmse = max(rmse, MIN_RMSE_CLAMP)
                     except Exception:
                         break
 
                     errors = np.abs(Y_train - y_train_pred)
-                    max_error_idx = int(np.argmax(errors))
-                    max_error = errors[max_error_idx]
+                    chi2_vals_init = (errors / rmse)**2
+                    outlier_mask = chi2_vals_init > chi2_threshold
 
-                    chi2_val_init = (max_error / rmse)**2
-                    if chi2_val_init > chi2_threshold:
-                        active_pool.pop(max_error_idx)
+                    if np.any(outlier_mask):
+                        # Multi-outlier pruning: remove all observations exceeding threshold simultaneously
+                        active_pool = [active_pool[k] for k in range(len(active_pool)) if not outlier_mask[k]]
                     else:
                         initialization_successful = True
+                        last_active_features = active_features
                         break
 
                 if not initialization_successful:
@@ -335,7 +583,7 @@ def _process_row_chunk(chunk_args):
                     continue
 
                 # Hand-off to OLS for RLS initialization
-                active_features = np.where(lasso_model.coef_ != 0)[0]
+                active_features = last_active_features
 
                 # If constant term is enabled, force it to be active
                 if ENABLE_CONSTANT and 0 not in active_features:
@@ -378,67 +626,73 @@ def _process_row_chunk(chunk_args):
                     i += 1
                     continue
 
-                # Backfill predictions for initialization window
-                for global_idx in valid_indices[segment_start_idx:train_end]:
-                    x_target = X_full[global_idx, :]
-                    chunk_pred[global_idx, y_local, x] = np.dot(x_target, theta)
-                    chunk_rmse[global_idx, y_local, x] = rmse
-                    chunk_coef[global_idx, y_local, x, :] = theta
+                # Backfill predictions for initialization window (Numba JIT accelerated)
+                backfill_init_window_numba(
+                    valid_indices, segment_start_idx, train_end,
+                    X_full, theta, rmse,
+                    chunk_pred, chunk_rmse, chunk_coef,
+                    y_local, x
+                )
 
+                seg_counter += 1
                 consecutive_count = 0
                 break_detected = False
+                target_j = train_end - 1
 
-                # 2. Forward Expanding Phase
-                for j in range(train_end, len(valid_indices)):
-                    target_idx = valid_indices[j]
-
-                    x_target = X_full[target_idx, :]
-                    y_pred = np.dot(x_target, theta)
-
-                    actual = y_data_chunk[target_idx, y_local, x]
-                    error = abs(actual - y_pred)
-
-                    chunk_pred[target_idx, y_local, x] = y_pred
-                    chunk_rmse[target_idx, y_local, x] = rmse
-                    chunk_coef[target_idx, y_local, x, :] = theta
-
-                    chi2_val = (error / rmse)**2
-                    is_anomaly = chi2_val > chi2_threshold
-
-                    if is_anomaly:
-                        chunk_flags[target_idx, y_local, x] = 1
-                        consecutive_count += 1
-
-                        if consecutive_count >= consec_anom:
-                            chunk_count[y_local, x] += 1
-                            if np.isnan(chunk_date[y_local, x]):
-                                first_anomaly_idx = valid_indices[j - consec_anom + 1]
-                                chunk_date[y_local, x] = acq_times[first_anomaly_idx]
-
-                            break_detected = True
-                            break
-                    else:
-                        consecutive_count = 0
-                        # RLS Update Step
-                        x_target_2d = x_target.reshape(-1, 1)
-                        Px = P @ x_target_2d
-                        denom = RLS_FORGETTING_FACTOR + (x_target_2d.T @ Px)[0, 0]
-                        K = Px / denom
-
-                        e = actual - y_pred
-
-                        theta = theta + (K.flatten() * e)
-                        P = (P - (K @ (x_target_2d.T @ P))) / RLS_FORGETTING_FACTOR
-                        SSE = SSE + (e**2) / denom
-                        n_points += 1
-                        new_rmse = np.sqrt(SSE / max(1, n_points - dof))
+                # 2. Forward Expanding Phase (Numba JIT accelerated)
+                break_detected, target_j, first_anomaly_idx, theta, P, SSE, n_points = rls_forward_pass_numba(
+                    valid_indices, train_end, y_data_chunk[:, y_local, x], X_full,
+                    theta, P, rmse, SSE, dof, n_points,
+                    chi2_threshold, consec_anom, RLS_FORGETTING_FACTOR,
+                    chunk_pred, chunk_rmse, chunk_coef, chunk_flags,
+                    y_local, x
+                )
 
                 if break_detected:
-                    i = j - consec_anom + 1
+                    chunk_count[y_local, x] += 1
+                    if np.isnan(chunk_date[y_local, x]):
+                        chunk_date[y_local, x] = acq_times[first_anomaly_idx]
+
+                    pixel_segments.append({
+                        "segment_idx": seg_counter,
+                        "start_idx": int(valid_indices[segment_start_idx]),
+                        "start_date": float(acq_times[valid_indices[segment_start_idx]]),
+                        "end_idx": int(valid_indices[target_j]),
+                        "end_date": float(acq_times[valid_indices[target_j]]),
+                        "has_break": True,
+                        "break_num": int(chunk_count[y_local, x]),
+                        "break_idx": int(first_anomaly_idx),
+                        "break_date": float(acq_times[first_anomaly_idx]),
+                        "confirm_idx": int(valid_indices[target_j]),
+                        "confirm_date": float(acq_times[valid_indices[target_j]]),
+                        "rmse": float(rmse),
+                        "coef": theta.copy(),
+                        "n_points": int(n_points),
+                    })
+                    i = target_j - consec_anom + 1
                 else:
+                    pixel_segments.append({
+                        "segment_idx": seg_counter,
+                        "start_idx": int(valid_indices[segment_start_idx]),
+                        "start_date": float(acq_times[valid_indices[segment_start_idx]]),
+                        "end_idx": int(valid_indices[target_j]),
+                        "end_date": float(acq_times[valid_indices[target_j]]),
+                        "has_break": False,
+                        "break_num": 0,
+                        "break_idx": -1,
+                        "break_date": np.nan,
+                        "confirm_idx": -1,
+                        "confirm_date": np.nan,
+                        "rmse": float(rmse),
+                        "coef": theta.copy(),
+                        "n_points": int(n_points),
+                    })
                     break
 
-    return y_start, y_end, chunk_pred, chunk_rmse, chunk_coef, chunk_flags, chunk_date, chunk_count
+            if pixel_segments:
+                chunk_segments[(y_local, x)] = pixel_segments
+
+    return y_start, y_end, chunk_pred, chunk_rmse, chunk_coef, chunk_flags, chunk_date, chunk_count, chunk_segments
 
 
 def main(enable_const=ENABLE_CONSTANT,
@@ -452,7 +706,7 @@ def main(enable_const=ENABLE_CONSTANT,
          h5_path=None,
          output_h5=None,
          n_jobs=None,
-         chunk_size=4,
+         chunk_size=1,
          launch_vis=False,
          row_start=0,
          row_end=None,
@@ -595,7 +849,8 @@ def main(enable_const=ENABLE_CONSTANT,
             results = Parallel(n_jobs=n_jobs, backend='loky', return_as='generator')(
                 delayed(_process_row_chunk)(chunk) for chunk in chunks
             )
-        for y_start, y_end, c_pred, c_rmse, c_coef, c_flags, c_date, c_count in results:
+        for res in results:
+            y_start, y_end, c_pred, c_rmse, c_coef, c_flags, c_date, c_count = res[:8]
             predicted_series[:, y_start:y_end, :] = c_pred
             rmse_series[:, y_start:y_end, :] = c_rmse
             coef_series[:, y_start:y_end, :, :] = c_coef
@@ -604,7 +859,8 @@ def main(enable_const=ENABLE_CONSTANT,
             change_count_map[y_start:y_end, :] = c_count
     else:
         for chunk in tqdm(chunks, desc="Processing row chunks"):
-            y_start, y_end, c_pred, c_rmse, c_coef, c_flags, c_date, c_count = _process_row_chunk(chunk)
+            res = _process_row_chunk(chunk)
+            y_start, y_end, c_pred, c_rmse, c_coef, c_flags, c_date, c_count = res[:8]
             predicted_series[:, y_start:y_end, :] = c_pred
             rmse_series[:, y_start:y_end, :] = c_rmse
             coef_series[:, y_start:y_end, :, :] = c_coef
@@ -640,28 +896,28 @@ def main(enable_const=ENABLE_CONSTANT,
         ccd_grp.attrs['SOURCE_DATA'] = h5_path
         ccd_grp.attrs['acquisition_time'] = acq_times
 
-        ds_pred = ccd_grp.create_dataset('predicted_series', data=predicted_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_pred = ccd_grp.create_dataset('predicted_series', data=predicted_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=1)
         ds_pred.attrs['_FillValue'] = np.nan
 
-        ds_rmse = ccd_grp.create_dataset('rmse_series', data=rmse_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_rmse = ccd_grp.create_dataset('rmse_series', data=rmse_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=1)
         ds_rmse.attrs['_FillValue'] = np.nan
 
-        ds_coef = ccd_grp.create_dataset('coef_series', data=coef_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_coef = ccd_grp.create_dataset('coef_series', data=coef_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=1)
         ds_coef.attrs['_FillValue'] = np.nan
 
-        ds_flags = ccd_grp.create_dataset('anomaly_flags', data=anomaly_flags, fillvalue=0, shuffle=True, compression='gzip', compression_opts=6)
+        ds_flags = ccd_grp.create_dataset('anomaly_flags', data=anomaly_flags, fillvalue=0, shuffle=True, compression='gzip', compression_opts=1)
         ds_flags.attrs['_FillValue'] = np.uint8(0)
 
-        ds_date = ccd_grp.create_dataset('change_date_timestamp', data=change_date_map, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_date = ccd_grp.create_dataset('change_date_timestamp', data=change_date_map, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=1)
         ds_date.attrs['_FillValue'] = np.nan
 
-        ds_count = ccd_grp.create_dataset('change_count', data=change_count_map, fillvalue=0, shuffle=True, compression='gzip', compression_opts=6)
+        ds_count = ccd_grp.create_dataset('change_count', data=change_count_map, fillvalue=0, shuffle=True, compression='gzip', compression_opts=1)
         ds_count.attrs['_FillValue'] = np.int32(0)
 
     if launch_vis:
         try:
-            import harmonized_CCD_vis
-            harmonized_CCD_vis.plot_spatial_anomaly_overlay(
+            import SC_CCM_vis
+            SC_CCM_vis.plot_spatial_anomaly_overlay(
                 source_h5_path=output_h5,
                 target_metric=target_short_name,
                 injected=is_inj,

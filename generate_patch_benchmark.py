@@ -50,7 +50,7 @@ if str(script_dir) not in sys.path:
 
 # Import core modules
 import SpecComplexTorch as sc
-import harmonized_CCD_main as hccd
+import SC_CCM_main as hccd
 import pyccd_landsat_main as pccd
 import ccd
 
@@ -61,7 +61,7 @@ pccd.patch_pyccd()
 # PIPELINE CONFIGURATION
 # ==============================================================================
 MASTER_H5_PATH = "C:/satelliteImagery/HLST30/HLST_Rochesterv2.h5"
-INJECTION_ONSET_DATE = "2022-04-01"
+INJECTION_ONSET_DATE = "2022-06-01"
 SPLIB_BASE = "C:/satelliteImagery/ground_truth/splib07/ASCIIdata"
 
 # Pipeline and patch parameters
@@ -327,22 +327,53 @@ INJ_OFFSETS = [
 # Fractional abundance levels
 MIXTURE_FRACTIONS = np.arange(0.00,1.05, step=0.05)
 
-# Compound data type for tabular results
+# Compound data type for tabular instance results (1 record per test instance)
 BREAK_RECORD_DTYPE = np.dtype([
-    ("condition_idx", np.int16),        # 0 to 49
+    ("condition_idx", np.int16),        # 0 to num_conditions - 1
     ("material_id", "S32"),             # Target material identifier string
     ("material_name", "S48"),           # Material descriptive name
-    ("mixture_fraction", np.float32),   # 0.05, 0.15, 0.25, 0.35, 0.45
-    ("patch_id", "S16"),                # 'AGRI', 'FOREST', 'WETLAND', 'SYNTHETIC'
+    ("mixture_fraction", np.float32),   # 0.00 to 1.00
+    ("patch_id", "S16"),                # 'CROPLAND', 'TREE COVER', 'WETLAND', 'DEVELOPED'
     ("patch_name", "S48"),              # Full stratum description
     ("pixel_num", np.int8),             # 1 to 4
     ("scene_row", np.int16),            # Absolute row coordinate in master scene
     ("scene_col", np.int16),            # Absolute col coordinate in master scene
     ("break_detected", np.bool_),       # True if break detected post-onset
-    ("break_timestamp", np.float64),    # Acquisition timestamp of detected break
+    ("break_timestamp", np.float64),    # Acquisition timestamp of detected post-onset break
     ("latency_days", np.float32),       # Days between onset date and detected break
     ("break_magnitude", np.float32),    # Magnitude of break or residual shift
     ("p_value", np.float32),            # Chi-square or model significance
+    ("total_breaks", np.int16),         # Total number of breaks across entire time series
+    ("post_onset_breaks", np.int16),    # Number of breaks occurring post-onset
+    ("has_multiple_post_breaks", np.bool_), # True if post_onset_breaks > 1
+    ("confirmation_timestamp", np.float64), # Timestamp of the 6th anomaly (confirmation)
+    ("confirmation_latency_days", np.float32), # Days from onset to confirmation
+])
+
+# Compound data type for all temporal curve segments and breaks across the time series
+SEGMENT_RECORD_DTYPE = np.dtype([
+    ("condition_idx", np.int16),
+    ("material_id", "S32"),
+    ("material_name", "S48"),
+    ("mixture_fraction", np.float32),
+    ("patch_id", "S16"),
+    ("patch_name", "S48"),
+    ("pixel_num", np.int8),
+    ("scene_row", np.int16),
+    ("scene_col", np.int16),
+    ("segment_num", np.int8),                  # 1, 2, ...
+    ("start_timestamp", np.float64),           # Timestamp of segment start observation
+    ("end_timestamp", np.float64),             # Timestamp of segment end observation
+    ("has_break", np.bool_),                   # True if segment terminated by break, False if active until end
+    ("break_num", np.int8),                    # 1, 2, ... (or 0 if no break)
+    ("break_timestamp", np.float64),           # Timestamp of first anomaly in run
+    ("confirmation_timestamp", np.float64),    # Timestamp of confirmation observation
+    ("is_post_onset", np.bool_),               # True if break occurred on or after injection onset
+    ("latency_days", np.float32),              # Days from onset date to break_timestamp (NaN if pre-onset)
+    ("confirmation_latency_days", np.float32), # Days from onset date to confirmation (NaN if pre-onset)
+    ("break_magnitude", np.float32),           # Residual jump magnitude
+    ("rmse", np.float32),                      # Segment model RMSE
+    ("num_observations", np.int16),            # Number of observations in segment
 ])
 
 
@@ -828,6 +859,7 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
     results_table = np.zeros(total_records, dtype=BREAK_RECORD_DTYPE)
     scccd_change_dates = np.full((num_conditions, n_patches, PATCH_SIZE, PATCH_SIZE), np.nan, dtype=np.float64)
     scccd_change_counts = np.zeros((num_conditions, n_patches, PATCH_SIZE, PATCH_SIZE), dtype=np.int32)
+    scccd_segment_list = []
 
     rec_idx = 0
     cond_idx = 0
@@ -861,10 +893,29 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
                 chunk_pred = res[2]
                 chunk_date = res[6]
                 chunk_count = res[7]
+                chunk_segments = res[8] if len(res) > 8 else {}
 
-                # Maintain and record spatial results for inner 9x9 evaluated region; outer 2px remain NaN / 0
-                scccd_change_dates[cond_idx, p_idx, 2:11, 2:11] = chunk_date
-                scccd_change_counts[cond_idx, p_idx, 2:11, 2:11] = chunk_count
+                # Record spatial results for inner 9x9 evaluated region; store post-onset break date if present
+                for r_in in range(9):
+                    for c_in in range(9):
+                        p_segs = chunk_segments.get((r_in, c_in), [])
+                        p_cnt = len([s for s in p_segs if s.get("has_break", False)])
+                        scccd_change_counts[cond_idx, p_idx, 2 + r_in, 2 + c_in] = p_cnt
+
+                        eff_ts_p = np.nan
+                        for s in p_segs:
+                            if s.get("has_break", False):
+                                b_ts_cand = s.get("break_date", np.nan)
+                                c_ts_cand = s.get("confirm_date", np.nan)
+                                if b_ts_cand >= onset_ts:
+                                    eff_ts_p = b_ts_cand
+                                    break
+                                elif c_ts_cand >= onset_ts:
+                                    run_idx = [k for k in range(s["break_idx"], s["confirm_idx"] + 1)
+                                               if valid_inner[k, r_in, c_in] and harm_acq_times[k] >= onset_ts]
+                                    eff_ts_p = float(harm_acq_times[run_idx[0]]) if run_idx else c_ts_cand
+                                    break
+                        scccd_change_dates[cond_idx, p_idx, 2 + r_in, 2 + c_in] = eff_ts_p
 
                 for p_num, (roff, coff) in enumerate(INJ_OFFSETS, 1):
                     scene_r = r0 + roff
@@ -873,22 +924,98 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
                     inner_r = roff - 2
                     inner_c = coff - 2
                     b_count = int(chunk_count[inner_r, inner_c])
-                    b_date = float(chunk_date[inner_r, inner_c])
+                    pixel_segs = chunk_segments.get((inner_r, inner_c), [])
+
+                    # Parse all segments and identify post-onset breaks
+                    post_onset_breaks = []
+                    for s in pixel_segs:
+                        has_b = s.get("has_break", False)
+                        b_ts = s.get("break_date", np.nan)
+                        c_ts = s.get("confirm_date", np.nan)
+                        is_post = False
+                        eff_b_ts = np.nan
+
+                        if has_b:
+                            if b_ts >= onset_ts:
+                                is_post = True
+                                eff_b_ts = b_ts
+                            elif c_ts >= onset_ts:
+                                run_idx = [k for k in range(s["break_idx"], s["confirm_idx"] + 1)
+                                           if valid_inner[k, inner_r, inner_c] and harm_acq_times[k] >= onset_ts]
+                                eff_b_ts = float(harm_acq_times[run_idx[0]]) if run_idx else c_ts
+                                is_post = True
+
+                            if is_post:
+                                post_onset_breaks.append({
+                                    "segment": s,
+                                    "break_timestamp": eff_b_ts,
+                                    "confirmation_timestamp": c_ts,
+                                    "raw_break_timestamp": b_ts,
+                                })
+
+                        # Segment residual magnitude
+                        s_start = s["start_idx"]
+                        s_end = s["end_idx"]
+                        v_seg = np.where(valid_inner[s_start:s_end+1, inner_r, inner_c])[0] + s_start
+                        if len(v_seg) > 0:
+                            act_s = y_inner[v_seg, inner_r, inner_c]
+                            pred_s = chunk_pred[v_seg, inner_r, inner_c]
+                            mag_seg = float(np.nanmean(np.abs(act_s - pred_s)))
+                        else:
+                            mag_seg = 0.0
+
+                        seg_rec = np.zeros(1, dtype=SEGMENT_RECORD_DTYPE)[0]
+                        seg_rec["condition_idx"] = cond_idx
+                        seg_rec["material_id"] = m_id
+                        seg_rec["material_name"] = m_name
+                        seg_rec["mixture_fraction"] = f_weight
+                        seg_rec["patch_id"] = p_id
+                        seg_rec["patch_name"] = p_name
+                        seg_rec["pixel_num"] = p_num
+                        seg_rec["scene_row"] = scene_r
+                        seg_rec["scene_col"] = scene_c
+                        seg_rec["segment_num"] = s["segment_idx"]
+                        seg_rec["start_timestamp"] = s["start_date"]
+                        seg_rec["end_timestamp"] = s["end_date"]
+                        seg_rec["has_break"] = has_b
+                        seg_rec["break_num"] = s.get("break_num", 0)
+                        seg_rec["break_timestamp"] = eff_b_ts if is_post else b_ts
+                        seg_rec["confirmation_timestamp"] = c_ts
+                        seg_rec["is_post_onset"] = is_post
+                        seg_rec["latency_days"] = float((eff_b_ts - onset_ts) / 86400.0) if is_post else np.nan
+                        seg_rec["confirmation_latency_days"] = float((c_ts - onset_ts) / 86400.0) if is_post else np.nan
+                        seg_rec["break_magnitude"] = mag_seg
+                        seg_rec["rmse"] = float(s["rmse"])
+                        seg_rec["num_observations"] = int(s["n_points"])
+                        scccd_segment_list.append(seg_rec)
 
                     # Compare against baseline SC-CCD evaluation (produced by harmonized_CCD_main.py)
                     base_count = int(baseline_scccd["count"][p_idx, roff, coff])
                     base_date = float(baseline_scccd["date"][p_idx, roff, coff])
 
+                    n_post = len(post_onset_breaks)
+                    has_mult = (n_post > 1)
+
                     # Detection criteria: break occurred on or after onset date that was not already present in baseline
-                    has_break_post_onset = (b_count > 0) and (not np.isnan(b_date)) and (b_date >= onset_ts)
-                    is_new_break = has_break_post_onset and (
-                        (base_count == 0) or
-                        np.isnan(base_date) or
-                        (b_count > base_count) or
-                        (b_date < base_date)
-                    )
-                    detected = is_new_break
-                    latency = float((b_date - onset_ts) / 86400.0) if detected else np.nan
+                    if n_post > 0:
+                        primary_brk = post_onset_breaks[0]
+                        pri_b_ts = primary_brk["break_timestamp"]
+                        pri_c_ts = primary_brk["confirmation_timestamp"]
+                        is_new_break = (
+                            (base_count == 0) or
+                            np.isnan(base_date) or
+                            (b_count > base_count) or
+                            (pri_b_ts < base_date)
+                        )
+                        detected = is_new_break
+                        latency = float((pri_b_ts - onset_ts) / 86400.0) if detected else np.nan
+                        confirm_lat = float((pri_c_ts - onset_ts) / 86400.0) if detected else np.nan
+                    else:
+                        pri_b_ts = np.nan
+                        pri_c_ts = np.nan
+                        detected = False
+                        latency = np.nan
+                        confirm_lat = np.nan
 
                     # Break magnitude: residual jump post-onset
                     if detected:
@@ -913,25 +1040,34 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
                     rec["scene_row"] = scene_r
                     rec["scene_col"] = scene_c
                     rec["break_detected"] = detected
-                    rec["break_timestamp"] = b_date if detected else np.nan
+                    rec["break_timestamp"] = pri_b_ts if detected else np.nan
                     rec["latency_days"] = latency
                     rec["break_magnitude"] = mag
                     rec["p_value"] = 0.99 if detected else 0.0
+                    rec["total_breaks"] = b_count
+                    rec["post_onset_breaks"] = n_post
+                    rec["has_multiple_post_breaks"] = has_mult
+                    rec["confirmation_timestamp"] = pri_c_ts if detected else np.nan
+                    rec["confirmation_latency_days"] = confirm_lat
 
                     rec_idx += 1
 
             cond_idx += 1
 
     detected_count = np.sum(results_table["break_detected"])
+    multiple_break_count = np.sum(results_table["has_multiple_post_breaks"])
+    scccd_segments = np.array(scccd_segment_list, dtype=SEGMENT_RECORD_DTYPE)
     print(f"SC-CCD complete: {detected_count}/{total_records} breaks detected ({detected_count/total_records*100:.1f}%).")
+    print(f"SC-CCD multiple post-implant breaks: {multiple_break_count}/{total_records} ({multiple_break_count/total_records*100:.1f}%).")
+    print(f"SC-CCD total segment models recorded: {len(scccd_segments)} across {total_records} instances.")
 
     spatial_results = {
         "change_date": scccd_change_dates,
         "change_count": scccd_change_counts,
     }
     if return_spatial:
-        return results_table, spatial_results
-    return results_table
+        return results_table, spatial_results, scccd_segments
+    return results_table, scccd_segments
 
 
 # ==============================================================================
@@ -973,6 +1109,7 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
     results_table = np.zeros(total_records, dtype=BREAK_RECORD_DTYPE)
     pyccd_change_dates = np.full((num_conditions, n_patches, PATCH_SIZE, PATCH_SIZE), np.nan, dtype=np.float64)
     pyccd_change_counts = np.zeros((num_conditions, n_patches, PATCH_SIZE, PATCH_SIZE), dtype=np.int32)
+    pyccd_segment_list = []
 
     rec_idx = 0
     cond_idx = 0
@@ -1049,6 +1186,7 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
                     latency = np.nan
                     mag = 0.0
                     b_count = 0
+                    post_onset_breaks = []
 
                     if usable_count >= pccd.MIN_CLEAR_SAMPLES:
                         try:
@@ -1062,20 +1200,59 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
                             models = res.get("change_models", [])
                             breaks = [m for m in models if m.get("change_probability", 0) > 0]
                             b_count = len(breaks)
-                            # Find first break on or after onset date
-                            for m in breaks:
+
+                            for m_idx_seg, m in enumerate(models, 1):
+                                s_day = m.get("start_day")
+                                e_day = m.get("end_day")
                                 b_day = m.get("break_day")
-                                if b_day is not None and b_day >= onset_ordinal:
-                                    detected = True
-                                    b_date_obj = datetime.date.fromordinal(b_day)
-                                    break_ts = datetime.datetime(
-                                        b_date_obj.year, b_date_obj.month, b_date_obj.day,
-                                        tzinfo=datetime.timezone.utc
-                                    ).timestamp()
-                                    latency = float((break_ts - onset_ts) / 86400.0)
+                                has_b = (b_day is not None and b_day > 0 and m.get("change_probability", 0) > 0)
+
+                                s_dt = datetime.date.fromordinal(s_day)
+                                s_ts = datetime.datetime(s_dt.year, s_dt.month, s_dt.day, tzinfo=datetime.timezone.utc).timestamp()
+                                e_dt = datetime.date.fromordinal(e_day)
+                                e_ts = datetime.datetime(e_dt.year, e_dt.month, e_dt.day, tzinfo=datetime.timezone.utc).timestamp()
+
+                                if has_b:
+                                    b_dt = datetime.date.fromordinal(b_day)
+                                    b_time = datetime.datetime(b_dt.year, b_dt.month, b_dt.day, tzinfo=datetime.timezone.utc).timestamp()
+                                    is_post = (b_day >= onset_ordinal)
+                                    lat_seg = float((b_time - onset_ts) / 86400.0) if is_post else np.nan
                                     mags = m.get("magnitudes", [0.0])
-                                    mag = float(np.linalg.norm(mags))
-                                    break
+                                    mag_seg = float(np.linalg.norm(mags))
+                                    if is_post:
+                                        post_onset_breaks.append((b_time, lat_seg, mag_seg))
+                                else:
+                                    b_time = np.nan
+                                    is_post = False
+                                    lat_seg = np.nan
+                                    mag_seg = 0.0
+
+                                seg_rec = np.zeros(1, dtype=SEGMENT_RECORD_DTYPE)[0]
+                                seg_rec["condition_idx"] = cond_idx
+                                seg_rec["material_id"] = m_id
+                                seg_rec["material_name"] = m_name
+                                seg_rec["mixture_fraction"] = f_weight
+                                seg_rec["patch_id"] = p_id
+                                seg_rec["patch_name"] = p_name
+                                seg_rec["pixel_num"] = p_num
+                                seg_rec["scene_row"] = scene_r
+                                seg_rec["scene_col"] = scene_c
+                                seg_rec["segment_num"] = m_idx_seg
+                                seg_rec["start_timestamp"] = s_ts
+                                seg_rec["end_timestamp"] = e_ts
+                                seg_rec["has_break"] = has_b
+                                seg_rec["break_num"] = m_idx_seg if has_b else 0
+                                seg_rec["break_timestamp"] = b_time
+                                seg_rec["confirmation_timestamp"] = b_time
+                                seg_rec["is_post_onset"] = is_post
+                                seg_rec["latency_days"] = lat_seg
+                                seg_rec["confirmation_latency_days"] = lat_seg
+                                seg_rec["break_magnitude"] = mag_seg
+                                rmse_val = m.get("rmse", [0.0])
+                                seg_rec["rmse"] = float(np.mean(rmse_val)) if hasattr(rmse_val, '__len__') else float(rmse_val)
+                                seg_rec["num_observations"] = int(m.get("observation_count", 0))
+                                pyccd_segment_list.append(seg_rec)
+
                         except Exception:
                             detected = False
                             b_count = 0
@@ -1084,15 +1261,27 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
                     base_count = int(baseline_pyccd["count"][p_idx, roff, coff])
                     base_date = float(baseline_pyccd["date"][p_idx, roff, coff])
 
-                    has_break_post_onset = detected and (not np.isnan(break_ts)) and (break_ts >= onset_ts)
-                    is_new_break = has_break_post_onset and (
-                        (base_count == 0) or
-                        np.isnan(base_date) or
-                        (b_count > base_count) or
-                        (break_ts < base_date)
-                    )
-                    detected = is_new_break
-                    latency = float((break_ts - onset_ts) / 86400.0) if detected else np.nan
+                    n_post = len(post_onset_breaks)
+                    has_mult = (n_post > 1)
+
+                    if n_post > 0:
+                        pri_b_ts, pri_lat, pri_mag = post_onset_breaks[0]
+                        has_break_post_onset = (not np.isnan(pri_b_ts)) and (pri_b_ts >= onset_ts)
+                        is_new_break = has_break_post_onset and (
+                            (base_count == 0) or
+                            np.isnan(base_date) or
+                            (b_count > base_count) or
+                            (pri_b_ts < base_date)
+                        )
+                        detected = is_new_break
+                        break_ts = pri_b_ts if detected else np.nan
+                        latency = pri_lat if detected else np.nan
+                        mag = pri_mag if detected else 0.0
+                    else:
+                        detected = False
+                        break_ts = np.nan
+                        latency = np.nan
+                        mag = 0.0
 
                     # Update the patch spatial arrays for the implanted pixel
                     pyccd_change_dates[cond_idx, p_idx, roff, coff] = break_ts if detected else np.nan
@@ -1109,32 +1298,42 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
                     rec["scene_row"] = scene_r
                     rec["scene_col"] = scene_c
                     rec["break_detected"] = detected
-                    rec["break_timestamp"] = break_ts if detected else np.nan
+                    rec["break_timestamp"] = break_ts
                     rec["latency_days"] = latency
                     rec["break_magnitude"] = mag
                     rec["p_value"] = 1.0 if detected else 0.0
+                    rec["total_breaks"] = b_count
+                    rec["post_onset_breaks"] = n_post
+                    rec["has_multiple_post_breaks"] = has_mult
+                    rec["confirmation_timestamp"] = break_ts
+                    rec["confirmation_latency_days"] = latency
 
                     rec_idx += 1
 
             cond_idx += 1
 
     detected_count = np.sum(results_table["break_detected"])
+    multiple_break_count = np.sum(results_table["has_multiple_post_breaks"])
+    pyccd_segments = np.array(pyccd_segment_list, dtype=SEGMENT_RECORD_DTYPE)
     print(f"PyCCD complete: {detected_count}/{total_records} breaks detected ({detected_count/total_records*100:.1f}%).")
+    print(f"PyCCD multiple post-implant breaks: {multiple_break_count}/{total_records} ({multiple_break_count/total_records*100:.1f}%).")
+    print(f"PyCCD total segment models recorded: {len(pyccd_segments)} across {total_records} instances.")
 
     spatial_results = {
         "change_date": pyccd_change_dates,
         "change_count": pyccd_change_counts,
     }
     if return_spatial:
-        return results_table, spatial_results
-    return results_table
+        return results_table, spatial_results, pyccd_segments
+    return results_table, pyccd_segments
 
 
 # ==============================================================================
 # STEP 6: COMMIT BENCHMARK DATASET TO MASTER HDF5 FILE
 # ==============================================================================
 def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes, scccd_table, pyccd_table,
-                           scccd_spatial=None, pyccd_spatial=None):
+                           scccd_spatial=None, pyccd_spatial=None,
+                           scccd_segments=None, pyccd_segments=None):
     """
     Writes the complete /STRATIFIED_CHIP_BENCHMARK/ hierarchy to the master HDF5 container.
     """
@@ -1313,6 +1512,10 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
     res_grp = base_grp.create_group("RESULTS")
     res_grp.create_dataset("scccd_break_table", data=scccd_table, compression="gzip")
     res_grp.create_dataset("pyccd_break_table", data=pyccd_table, compression="gzip")
+    if scccd_segments is not None:
+        res_grp.create_dataset("scccd_break_segments", data=scccd_segments, compression="gzip")
+    if pyccd_segments is not None:
+        res_grp.create_dataset("pyccd_break_segments", data=pyccd_segments, compression="gzip")
 
     if scccd_spatial is not None:
         for k, arr in scccd_spatial.items():
@@ -1341,18 +1544,18 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
 # ==============================================================================
 def print_performance_summary(scccd_table, pyccd_table):
     """
-    Prints comparative detection accuracy and latency tables stratified by land-cover class.
+    Prints comparative detection accuracy, latency, and multiple-break statistics stratified by land-cover class.
     """
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 115)
     print("LAND-COVER STRATIFIED BENCHMARK PERFORMANCE SUMMARY: SC-CCD vs. USGS PYCCD")
-    print("=" * 90)
-
-    # 1. Performance Stratified by Land-Cover Class
-    print(f"\n{'Stratum ID':<10} | {'Land-Cover Stratum':<32} | {'SC-CCD Recall':<15} | {'PyCCD Recall':<15} | {'Median Latency (SC / Py)'}")
-    print("-" * 105)
+    print("=" * 115)
 
     patch_ids = [p["id"] for p in LAND_COVER_PATCHES]
     patch_names = [p["name"] for p in LAND_COVER_PATCHES]
+
+    # 1. Performance Stratified by Land-Cover Class
+    print(f"\n{'Stratum ID':<10} | {'Land-Cover Stratum':<32} | {'SC-CCD Recall':<15} | {'PyCCD Recall':<15} | {'SC Multi-Break':<15} | {'Py Multi-Break':<15} | {'Median Latency (SC / Py)'}")
+    print("-" * 135)
 
     for p_id, p_name in zip(patch_ids, patch_names):
         sc_sub = scccd_table[scccd_table["patch_id"] == p_id.encode()]
@@ -1361,18 +1564,24 @@ def print_performance_summary(scccd_table, pyccd_table):
         sc_rec = np.mean(sc_sub["break_detected"]) * 100.0
         py_rec = np.mean(py_sub["break_detected"]) * 100.0
 
+        sc_multi = np.mean(sc_sub["has_multiple_post_breaks"]) * 100.0
+        py_multi = np.mean(py_sub["has_multiple_post_breaks"]) * 100.0
+
         sc_lat = sc_sub["latency_days"][sc_sub["break_detected"]]
         py_lat = py_sub["latency_days"][py_sub["break_detected"]]
 
         sc_med_lat = f"{np.median(sc_lat):.1f} d" if len(sc_lat) > 0 else "N/A"
         py_med_lat = f"{np.median(py_lat):.1f} d" if len(py_lat) > 0 else "N/A"
 
-        print(f"{p_id:<10} | {p_name:<32} | {sc_rec:5.1f}% ({np.sum(sc_sub['break_detected']):3d}/{len(sc_sub):3d}) | "
-              f"{py_rec:5.1f}% ({np.sum(py_sub['break_detected']):3d}/{len(py_sub):3d}) | {sc_med_lat:<12} / {py_med_lat}")
+        print(f"{p_id:<10} | {p_name:<32} | {sc_rec:5.1f}% ({np.sum(sc_sub['break_detected']):4d}/{len(sc_sub):4d}) | "
+              f"{py_rec:5.1f}% ({np.sum(py_sub['break_detected']):4d}/{len(py_sub):4d}) | "
+              f"{sc_multi:5.1f}% ({np.sum(sc_sub['has_multiple_post_breaks']):4d}/{len(sc_sub):4d}) | "
+              f"{py_multi:5.1f}% ({np.sum(py_sub['has_multiple_post_breaks']):4d}/{len(py_sub):4d}) | "
+              f"{sc_med_lat:<12} / {py_med_lat}")
 
     # 2. Performance Stratified by Target Material
-    print(f"\n{'Material ID':<18} | {'Material Name':<34} | {'SC Recall':<12} | {'Py Recall':<12} | {'Median Latency (SC / Py)'}")
-    print("-" * 105)
+    print(f"\n{'Material ID':<18} | {'Material Name':<34} | {'SC Recall':<12} | {'Py Recall':<12} | {'SC Multi %':<12} | {'Py Multi %':<12} | {'Median Latency (SC / Py)'}")
+    print("-" * 135)
 
     mat_ids = np.unique(scccd_table["material_id"])
     for m_id in mat_ids:
@@ -1385,27 +1594,39 @@ def print_performance_summary(scccd_table, pyccd_table):
         sc_rec = np.mean(sc_sub["break_detected"]) * 100.0
         py_rec = np.mean(py_sub["break_detected"]) * 100.0
 
+        sc_multi = np.mean(sc_sub["has_multiple_post_breaks"]) * 100.0
+        py_multi = np.mean(py_sub["has_multiple_post_breaks"]) * 100.0
+
         sc_lat = sc_sub["latency_days"][sc_sub["break_detected"]]
         py_lat = py_sub["latency_days"][py_sub["break_detected"]]
 
         sc_med_lat = f"{np.median(sc_lat):.1f} d" if len(sc_lat) > 0 else "N/A"
         py_med_lat = f"{np.median(py_lat):.1f} d" if len(py_lat) > 0 else "N/A"
 
-        print(f"{m_id_str:<18} | {m_name:<34} | {sc_rec:5.1f}% ({np.sum(sc_sub['break_detected']):2d}/{len(sc_sub):2d}) | "
-              f"{py_rec:5.1f}% ({np.sum(py_sub['break_detected']):2d}/{len(py_sub):2d}) | {sc_med_lat:<12} / {py_med_lat}")
+        print(f"{m_id_str:<18} | {m_name:<34} | {sc_rec:5.1f}% ({np.sum(sc_sub['break_detected']):3d}/{len(sc_sub):3d}) | "
+              f"{py_rec:5.1f}% ({np.sum(py_sub['break_detected']):3d}/{len(py_sub):3d}) | "
+              f"{sc_multi:5.1f}% ({np.sum(sc_sub['has_multiple_post_breaks']):3d}/{len(sc_sub):3d}) | "
+              f"{py_multi:5.1f}% ({np.sum(py_sub['has_multiple_post_breaks']):3d}/{len(py_sub):3d}) | "
+              f"{sc_med_lat:<12} / {py_med_lat}")
 
     # 3. Overall Aggregate Performance
+    total_n = len(scccd_table)
     total_sc_rec = np.mean(scccd_table["break_detected"]) * 100.0
     total_py_rec = np.mean(pyccd_table["break_detected"]) * 100.0
+    total_sc_multi = np.mean(scccd_table["has_multiple_post_breaks"]) * 100.0
+    total_py_multi = np.mean(pyccd_table["has_multiple_post_breaks"]) * 100.0
+
     all_sc_lat = scccd_table["latency_days"][scccd_table["break_detected"]]
     all_py_lat = pyccd_table["latency_days"][pyccd_table["break_detected"]]
 
-    print("-" * 105)
-    print(f"{'OVERALL AGGREGATE':<18} | {'All 4 Strata & 10 Materials (N=800)':<34} | "
-          f"{total_sc_rec:5.1f}% ({np.sum(scccd_table['break_detected']):3d}/800) | "
-          f"{total_py_rec:5.1f}% ({np.sum(pyccd_table['break_detected']):3d}/800) | "
+    print("-" * 135)
+    print(f"{'OVERALL AGGREGATE':<18} | {f'All {len(patch_ids)} Strata & {len(mat_ids)} Materials (N={total_n})':<34} | "
+          f"{total_sc_rec:5.1f}% ({np.sum(scccd_table['break_detected']):4d}/{total_n}) | "
+          f"{total_py_rec:5.1f}% ({np.sum(pyccd_table['break_detected']):4d}/{total_n}) | "
+          f"{total_sc_multi:5.1f}% ({np.sum(scccd_table['has_multiple_post_breaks']):4d}/{total_n}) | "
+          f"{total_py_multi:5.1f}% ({np.sum(pyccd_table['has_multiple_post_breaks']):4d}/{total_n}) | "
           f"{np.median(all_sc_lat):.1f} d        / {np.median(all_py_lat):.1f} d")
-    print("=" * 105 + "\n")
+    print("=" * 135 + "\n")
 
 
 # ==============================================================================
@@ -1444,15 +1665,16 @@ def main():
         chips["HARMONIZED_z_score"] = unperturbed_z
 
         # Step 4: Run Harmonized SC-CCD break detection (full 9x9 patch across time to evaluate neighbor effects)
-        scccd_table, scccd_spatial = run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts)
+        scccd_table, scccd_spatial, scccd_segments = run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts)
 
         # Step 5: Run USGS LCMAP Landsat PyCCD break detection (4 implanted pixels per patch, copying baseline for neighbors)
-        pyccd_table, pyccd_spatial = run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts)
+        pyccd_table, pyccd_spatial, pyccd_segments = run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts)
 
         # Step 6: Commit complete benchmark group to master HDF5
         save_benchmark_to_hdf5(
             h5_file, chips, metadata, target_spectra, sim_z_cubes, scccd_table, pyccd_table,
-            scccd_spatial=scccd_spatial, pyccd_spatial=pyccd_spatial
+            scccd_spatial=scccd_spatial, pyccd_spatial=pyccd_spatial,
+            scccd_segments=scccd_segments, pyccd_segments=pyccd_segments
         )
 
     # Step 7: Print quantitative summary
