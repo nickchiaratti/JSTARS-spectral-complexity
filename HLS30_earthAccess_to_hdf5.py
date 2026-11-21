@@ -37,10 +37,10 @@ L30_SR_WAVELENGTHS = [0.443, 0.482, 0.561, 0.655, 0.865, 1.609, 2.201]
 
 # Sentinel constants and fill values
 FILL_VALUE_REFLECTANCE_RAW = -9999
-FILL_VALUE_FMASK_RAW = 255
-FILL_VALUE_ANGLES_RAW = 40000
-
 SCALE_FACTOR_REFLECTANCE = 0.0001
+FILL_VALUE_FMASK_RAW = 255
+
+FILL_VALUE_ANGLES_RAW = 40000
 SCALE_FACTOR_ANGLES = 0.01
 
 def load_locations_config(config_path=None):
@@ -118,16 +118,16 @@ def stream_native_tiles_to_hdf5(h5f, sensor_prefix, tile_collections, expected_s
         chunk_h, chunk_w = min(h, 256), min(w, 256)
         
         sr_ds = grp.create_dataset('surface_reflectance', shape=(num_frames, expected_sr, h, w), 
-                                   chunks=(1, expected_sr, chunk_h, chunk_w),
-                                   dtype=np.float32, shuffle=True, compression='gzip', compression_opts=6)
+                                   chunks=(1, expected_sr, chunk_h, chunk_w), fillvalue=FILL_VALUE_REFLECTANCE_RAW,  
+                                   dtype=np.int16, shuffle=True, compression='gzip', compression_opts=6)
         
         fm_ds = grp.create_dataset('Fmask', shape=(num_frames, h, w), 
-                                   chunks=(1, chunk_h, chunk_w),
+                                   chunks=(1, chunk_h, chunk_w), fillvalue=FILL_VALUE_FMASK_RAW,
                                    dtype=np.uint8, shuffle=True, compression='gzip', compression_opts=6)
                                    
         ag_ds = grp.create_dataset('solar_view_angles', shape=(num_frames, 4, h, w), 
-                                   chunks=(1, 4, chunk_h, chunk_w),
-                                   dtype=np.float32, shuffle=True, compression='gzip', compression_opts=6)
+                                   chunks=(1, 4, chunk_h, chunk_w), fillvalue=FILL_VALUE_ANGLES_RAW,
+                                   dtype=np.uint16, shuffle=True, compression='gzip', compression_opts=6)
 
         meta_arrays = {'acq': [], 'space': [], 'saz': [], 'sel': [], 'cc': []}
 
@@ -144,23 +144,22 @@ def stream_native_tiles_to_hdf5(h5f, sensor_prefix, tile_collections, expected_s
                 t_fm = src.read(expected_fmask_idx, window=read_window)
                 t_ag = src.read(list(range(expected_fmask_idx + 1, expected_fmask_idx + 5)), window=read_window)
 
-                sr_ds[idx, ...] = np.where(t_sr != FILL_VALUE_REFLECTANCE_RAW, t_sr.astype(np.float32) * SCALE_FACTOR_REFLECTANCE, np.nan)
+                sr_ds[idx, ...] = np.where(t_sr != FILL_VALUE_REFLECTANCE_RAW, t_sr, FILL_VALUE_REFLECTANCE_RAW)
                 
-                sr_valid = t_sr[0] != FILL_VALUE_REFLECTANCE_RAW
-                fm_pass = np.where((t_fm != FILL_VALUE_FMASK_RAW) & sr_valid, t_fm, FILL_VALUE_FMASK_RAW)
+                fm_pass = np.where((t_fm != FILL_VALUE_FMASK_RAW), t_fm, FILL_VALUE_FMASK_RAW)
                 fm_ds[idx, ...] = fm_pass
 
-                ag_pass = np.where((t_ag != FILL_VALUE_ANGLES_RAW) & sr_valid, t_ag * SCALE_FACTOR_ANGLES, np.nan)
+                ag_pass = np.where((t_ag != FILL_VALUE_ANGLES_RAW), t_ag, FILL_VALUE_ANGLES_RAW)
                 ag_ds[idx, ...] = ag_pass
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
-                mean_sza = np.nanmean(ag_pass[0])
-                mean_saa = np.nanmean(ag_pass[1])
+                valid_sza = ag_pass[0] != FILL_VALUE_ANGLES_RAW
+                valid_saa = ag_pass[1] != FILL_VALUE_ANGLES_RAW
+                mean_sza = (np.mean(ag_pass[0][valid_sza]) * SCALE_FACTOR_ANGLES) if np.any(valid_sza) else 0.0
+                mean_saa = (np.mean(ag_pass[1][valid_saa]) * SCALE_FACTOR_ANGLES) if np.any(valid_saa) else 0.0
 
             if np.isnan(mean_sza) or np.isnan(mean_saa):
-                if np.any(sr_valid):
-                    print(f"WARNING: Raster-derived mean sun angles are NaN for frame {idx} despite having valid SR data.")
                 mean_sza = 0.0
                 mean_saa = 0.0
 
@@ -173,15 +172,24 @@ def stream_native_tiles_to_hdf5(h5f, sensor_prefix, tile_collections, expected_s
         tf = tile_target_transform
         gdal_transform = np.array([tf.c, tf.a, tf.b, tf.f, tf.d, tf.e], dtype='float64')
                                    
+        # Surface Reflectance Attributes
         sr_ds.attrs['units'] = "Reflectance"
-        sr_ds.attrs['_FillValue'] = np.nan
+        sr_ds.attrs['_FillValue'] = FILL_VALUE_REFLECTANCE_RAW             # -9999
+        sr_ds.attrs['scale_to_float'] = SCALE_FACTOR_REFLECTANCE           # 0.0001 (Multiplier)
+        sr_ds.attrs['scale_factor'] = 1 / SCALE_FACTOR_REFLECTANCE         # 10000.0 (Divisor for legacy readers)
         sr_ds.attrs['wavelengths'] = wavelengths
-        
         sr_ds.attrs['spatial_ref'] = tile_crs.to_wkt()
         sr_ds.attrs['GeoTransform'] = gdal_transform
 
-        fm_ds.attrs['_FillValue'] = FILL_VALUE_FMASK_RAW
-        ag_ds.attrs['_FillValue'] = np.nan
+        # Fmask Attributes
+        fm_ds.attrs['units'] = "Bit Flags"
+        fm_ds.attrs['_FillValue'] = FILL_VALUE_FMASK_RAW                   # 255
+
+        # Solar and View Angles Attributes
+        ag_ds.attrs['units'] = "Degrees"
+        ag_ds.attrs['_FillValue'] = FILL_VALUE_ANGLES_RAW                  # 40000
+        ag_ds.attrs['scale_to_float'] = SCALE_FACTOR_ANGLES                # 0.01 (Multiplier)
+        ag_ds.attrs['scale_factor'] = 1 / SCALE_FACTOR_ANGLES              # 100.0 (Divisor for legacy readers)
         ag_ds.attrs['band_order'] = ["SZA", "SAA", "VZA", "VAA"]
         
         sr_ds.attrs.create('spacecraft_id', data=meta_arrays['space'], dtype=dt_str)

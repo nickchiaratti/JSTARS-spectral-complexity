@@ -10,7 +10,7 @@ import warnings
 from pathlib import Path
 import h5py
 import numpy as np
-import SpecComplex as sc
+import SpecComplexTorch as sc
 
 
 # ==============================================================================
@@ -19,19 +19,68 @@ import SpecComplex as sc
 
 def load_scaled_reflectance(dataset, slice_obj=np.s_[...]):
     """
-    Safely load a surface reflectance dataset from HDF5, detect if it is scaled int16,
+    Safely load a surface reflectance dataset from HDF5, detect if it is scaled integer,
     and convert it to float32 reflectance. Converts nodata values into np.nan.
+    Fails explicitly if an integer dataset lacks a fillvalue or scale factor attribute.
     """
     data = dataset[slice_obj] if hasattr(dataset, '__getitem__') and hasattr(dataset, 'attrs') else dataset
-    scale = dataset.attrs.get("scale_to_float") if hasattr(dataset, 'attrs') else None
 
-    if data.dtype in (np.int16, np.uint16, np.int32, np.int8, np.uint8):
-        nodata = dataset.fillvalue if hasattr(dataset, 'fillvalue') and dataset.fillvalue is not None else -32768
+    if np.issubdtype(data.dtype, np.integer):
+        nodata = None
+        if hasattr(dataset, "attrs"):
+            if "_FillValue" in dataset.attrs:
+                nodata = dataset.attrs["_FillValue"]
+            elif "fillvalue" in dataset.attrs:
+                nodata = dataset.attrs["fillvalue"]
+            elif "fill_value" in dataset.attrs:
+                nodata = dataset.attrs["fill_value"]
+
+        if nodata is None and hasattr(dataset, "fillvalue") and dataset.fillvalue is not None:
+            if dataset.fillvalue != 0:
+                nodata = dataset.fillvalue
+
+        if nodata is None:
+            raise KeyError(
+                f"Dataset {getattr(dataset, 'name', 'dataset')} has integer datatype ({data.dtype}) "
+                "but has no '_FillValue' attribute or non-zero fillvalue defined."
+            )
+
+        scale = None
+        if hasattr(dataset, "attrs"):
+            if "scale_to_float" in dataset.attrs:
+                scale = float(dataset.attrs["scale_to_float"])
+            elif "scale_factor" in dataset.attrs:
+                sf = float(dataset.attrs["scale_factor"])
+                scale = (1.0 / sf) if sf > 1.0 else sf
+
+        if scale is None:
+            raise KeyError(
+                f"Dataset {getattr(dataset, 'name', 'dataset')} has integer datatype ({data.dtype}) "
+                "but has no 'scale_to_float' or 'scale_factor' attribute defined."
+            )
+
         float_data = data.astype(np.float32)
         float_data[data == nodata] = np.nan
-        if scale is not None:
-            float_data *= scale
+        float_data *= scale
         return float_data
+
+    if np.issubdtype(data.dtype, np.floating):
+        nodata = None
+        if hasattr(dataset, "attrs"):
+            if "_FillValue" in dataset.attrs:
+                nodata = dataset.attrs["_FillValue"]
+            elif "fillvalue" in dataset.attrs:
+                nodata = dataset.attrs["fillvalue"]
+            elif "fill_value" in dataset.attrs:
+                nodata = dataset.attrs["fill_value"]
+
+        if nodata is None and hasattr(dataset, "fillvalue") and dataset.fillvalue is not None:
+            nodata = dataset.fillvalue
+
+        if nodata is not None and not np.isnan(nodata):
+            float_data = data.copy()
+            float_data[np.isclose(data, nodata, equal_nan=True)] = np.nan
+            return float_data
 
     return data
 
@@ -39,14 +88,19 @@ def load_scaled_reflectance(dataset, slice_obj=np.s_[...]):
 def load_tanager_sr(dataset, frame_idx, spatial_slice=np.s_[:, :]):
     """
     Load Tanager surface reflectance from source H5 dataset.
-    Converts int to float and strips defective or water absorption bands.
+    Only invokes load_scaled_reflectance if the dataset has an integer datatype.
+    Strips defective or water absorption bands according to good wavelengths metadata.
     """
     if isinstance(spatial_slice, tuple):
         raw_slice = (frame_idx, slice(None)) + spatial_slice
     else:
         raw_slice = (frame_idx, slice(None), spatial_slice)
 
-    float_data = load_scaled_reflectance(dataset, raw_slice)
+    dataset_dtype = getattr(dataset, "dtype", np.asarray(dataset).dtype)
+    if np.issubdtype(dataset_dtype, np.integer):
+        float_data = load_scaled_reflectance(dataset, raw_slice)
+    else:
+        float_data = dataset[raw_slice]
 
     gw_attr = dataset.attrs.get("all_good_wavelengths") if hasattr(dataset, 'attrs') else None
     wavelengths = dataset.attrs.get("wavelengths") if hasattr(dataset, 'attrs') else None
@@ -64,83 +118,8 @@ def load_tanager_sr(dataset, frame_idx, spatial_slice=np.s_[:, :]):
     return float_data_pruned, valid_wavelengths
 
 
-def load_enmap_sr(dataset, frame_idx, spatial_slice=np.s_[:, :]):
-    """
-    Load EnMAP surface reflectance from source H5 dataset.
-    Converts int to float, handles -32767 bad pixels, and strips defective bands.
-    """
-    if isinstance(spatial_slice, tuple):
-        raw_slice = (frame_idx, slice(None)) + spatial_slice
-    else:
-        raw_slice = (frame_idx, slice(None), spatial_slice)
 
-    float_data = load_scaled_reflectance(dataset, raw_slice)
-    scale = dataset.attrs.get("scale_to_float", 1.0) if hasattr(dataset, 'attrs') else 1.0
-    enmap_bad_pixel_scaled = -32767 * scale
-    float_data[np.isclose(float_data, enmap_bad_pixel_scaled, atol=1e-6)] = np.nan
-
-    gw_attr = dataset.attrs.get("all_good_wavelengths") if hasattr(dataset, 'attrs') else None
-    wavelengths = dataset.attrs.get("wavelengths") if hasattr(dataset, 'attrs') else None
-    if wavelengths is not None:
-        wavelengths = np.asarray(wavelengths)
-
-    if gw_attr is not None:
-        gw_mask = gw_attr[frame_idx].astype(bool)
-        float_data_pruned = float_data[gw_mask, ...]
-        valid_wavelengths = wavelengths[gw_mask] if wavelengths is not None else None
-    else:
-        float_data_pruned = float_data
-        valid_wavelengths = wavelengths
-
-    return float_data_pruned, valid_wavelengths
-
-
-def scale_to_int16(float_data, scale_factor=10000.0, nodata_value=-32768):
-    """
-    Scales a float32 array to int16 to reduce storage size.
-    NaNs are converted to the specified nodata_value.
-    """
-    if float_data is None:
-        return None
-
-    int_data = np.full(float_data.shape, nodata_value, dtype=np.int16)
-    valid_mask = ~np.isnan(float_data)
-    scaled_valid = np.round(float_data[valid_mask] * scale_factor)
-    scaled_valid = np.clip(scaled_valid, -32767, 32767)
-    int_data[valid_mask] = scaled_valid.astype(np.int16)
-    return int_data
-
-
-def read_scaled_int16(dataset, slice_obj=np.s_[...]):
-    """
-    Reads an HDF5 dataset, checks for scale_factor and _FillValue attributes,
-    and returns a float32 array.
-    """
-    data = dataset[slice_obj] if hasattr(dataset, '__getitem__') and hasattr(dataset, 'attrs') else dataset
-    scale_factor = dataset.attrs.get("scale_factor", 10000.0) if hasattr(dataset, 'attrs') else 10000.0
-    fill_value = None
-    if hasattr(dataset, 'attrs'):
-        fill_value = dataset.attrs.get("_FillValue")
-        if fill_value is None:
-            fill_value = dataset.attrs.get("fill_value")
-    if fill_value is None:
-        fill_value = -32768 # Default for our pipeline int16
-
-    if scale_factor is not None and data.dtype == np.int16:
-        float_data = data.astype(np.float32)
-        if fill_value is not None:
-            float_data[data == fill_value] = np.nan
-        return float_data / float(scale_factor)
-
-    if np.issubdtype(data.dtype, np.floating) and fill_value is not None:
-        data = data.copy()
-        data[data == fill_value] = np.nan
-        return data
-
-    return data
-
-
-def process_volume_frame(frame_data, num_endmembers=7, gram_type='minEndmember', norm_type=None):
+def process_volume_frame(frame_data, num_endmembers=7, gram_type='minEndmember', norm_param=None):
     """
     Process image frame to extract global endmembers, indices, and local Gram volume curve.
     Invokes sc.maximumDistance and sc.calcGramLocalVolumes.
@@ -149,10 +128,7 @@ def process_volume_frame(frame_data, num_endmembers=7, gram_type='minEndmember',
     img = np.transpose(frame_data, (1, 2, 0))
     image2D = np.reshape(img, (height * width, bands), order="F").copy()
 
-    if np.min(image2D) < 0:
-        image2D = np.clip(image2D, 0, 2)
-    if np.max(image2D) > 1:
-        image2D = np.clip(image2D, 0, 1)
+    image2D = np.clip(image2D, 0.0, 1.0)
 
     valid_mask = ~np.isnan(image2D).any(axis=1)
     if np.sum(valid_mask) < num_endmembers:
@@ -176,18 +152,9 @@ def process_volume_frame(frame_data, num_endmembers=7, gram_type='minEndmember',
     mean_vector = np.nanmean(img, axis=(0, 1))
     localization_vec = endmembers[:, 1]
 
-    if gram_type == 'datasetMean':
-        volume = sc.calcGramLocalVolumes(endmembers, localization_vector=mean_vector, divide_by_factorial=False, axis=1)
-    elif gram_type == 'minEndmember':
-        remaining_endmembers = np.delete(endmembers, 1, axis=1)
-        volume = sc.calcGramLocalVolumes(remaining_endmembers, localization_vector=localization_vec, divide_by_factorial=False, axis=1)
-        volume = np.insert(volume, 0, 0.0)
-    else:
-        volume = sc.calcGramLocalVolumes(endmembers, localization_vector=np.zeros(bands, dtype=np.float32), divide_by_factorial=False, axis=1)
-
-    if norm_type == 'bandCount':
-        m_array = np.arange(1, len(volume) + 1)
-        volume = volume / np.power(bands, (m_array / 2.0))
+    remaining_endmembers = np.delete(endmembers, 1, axis=1)
+    volume = sc.calcGramLocalVolumes(remaining_endmembers, localization_vector=localization_vec, divide_by_factorial=False, axis=1)
+    volume = np.insert(volume, 0, 0.0)
 
     return endmembers.astype(np.float32), endmember_indices.astype(np.int32), volume.astype(np.float32)
 
@@ -196,30 +163,35 @@ def process_volume_frame(frame_data, num_endmembers=7, gram_type='minEndmember',
 # DATASET CREATION AND MANAGEMENT HELPERS
 # ==============================================================================
 
-def overwrite_dset(data_grp, name, shape, dtype='int16', spatial_ref=None, geo_transform=None, chunks=None, **kwargs):
-    """Creates or overwrites a dataset in an HDF5 group with gzip level 5 compression."""
+def overwrite_dset(data_grp, name, shape, dtype, fillvalue=None, spatial_ref=None, geo_transform=None, chunks=None, **kwargs):
+    """Creates or overwrites a dataset in an HDF5 group with gzip level 6 compression."""
     if name in data_grp:
         del data_grp[name]
+
+    create_kwargs = {
+        "shuffle": True,
+        "compression": "gzip",
+        "compression_opts": 6,
+        "chunks": chunks,
+        **kwargs
+    }
+    if fillvalue is not None:
+        create_kwargs["fillvalue"] = fillvalue
 
     ds = data_grp.create_dataset(
         name,
         shape=shape,
         dtype=dtype,
-        shuffle=True, compression="gzip",
-        compression_opts=6,
-        chunks=chunks,
-        **kwargs
+        **create_kwargs
     )
 
     if spatial_ref is not None:
         ds.attrs['spatial_ref'] = spatial_ref
     if geo_transform is not None:
         ds.attrs['GeoTransform'] = geo_transform
-        
-    if dtype == 'int16' or dtype == np.int16:
-        ds.attrs['scale_factor'] = 10000.0
-        ds.attrs['_FillValue'] = -32768
-        
+    if fillvalue is not None:
+        ds.attrs['_FillValue'] = fillvalue
+
     return ds
 
 
@@ -266,9 +238,10 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
         print(f"Global Timeline Established: {total_frames} frames across {len(grids)} sensors.")
 
         ref_sr = h5_file[f"/HDFEOS/GRIDS/{grids[0]}/Data Fields/surface_reflectance"]
-        _, _, height, width = ref_sr.shape
-        spatial_ref = ref_sr.attrs.get('spatial_ref')
-        geo_transform = ref_sr.attrs.get('GeoTransform')
+        ref_grid = h5_file[f"/HDFEOS/GRIDS/{grids[0]}/Data Fields/common_mask"]
+        height, width = ref_grid.shape[-2:]
+        spatial_ref = ref_grid.attrs.get('spatial_ref') or ref_sr.attrs.get('spatial_ref')
+        geo_transform = ref_grid.attrs.get('GeoTransform') if 'GeoTransform' in ref_grid.attrs else ref_sr.attrs.get('GeoTransform')
 
         print("Pre-calculating global persistent water mask from Fmask history...")
         water_sum = np.zeros((height, width), dtype=np.int32)
@@ -306,10 +279,12 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
                 h5_file.create_group(harm_base)
             harm_grp = h5_file.create_group(harm_path)
 
-        ds_harm_mask = overwrite_dset(harm_grp, 'common_mask', (total_frames, height, width), dtype='uint8', spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
-        ds_harm_ortho = overwrite_dset(harm_grp, 'ortho_visual', (total_frames, 3, height, width), dtype='uint8', spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=(1, 3, chunk_h, chunk_w))
-        ds_harm_slide = overwrite_dset(harm_grp, 'sliding_volume_map', (total_frames, height, width), dtype='int16', spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
-        ds_harm_z = overwrite_dset(harm_grp, 'sliding_volume_z_score', (total_frames, height, width), dtype='int16', spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
+        ds_harm_mask = overwrite_dset(harm_grp, 'common_mask', (total_frames, height, width), dtype='uint8', fillvalue=255, spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
+        ds_harm_ortho = overwrite_dset(harm_grp, 'ortho_visual', (total_frames, 3, height, width), dtype='uint8', fillvalue=0, spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=(1, 3, chunk_h, chunk_w))
+        ds_harm_slide = overwrite_dset(harm_grp, 'sliding_volume_map', (total_frames, height, width), dtype='float32', fillvalue=np.nan, spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
+        ds_harm_z = overwrite_dset(harm_grp, 'sliding_volume_z_score', (total_frames, height, width), dtype='float32', fillvalue=np.nan, spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
+        ds_harm_ndvi = overwrite_dset(harm_grp, 'ndvi', (total_frames, height, width), dtype='float32', fillvalue=np.nan, spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=chunks_3d)
+
 
         sensor_dsets = {}
         for grid in grids:
@@ -317,12 +292,12 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
             sr_shape = data_grp["surface_reflectance"].shape
             n_frames, n_bands = sr_shape[0], sr_shape[1]
 
-            em_ds = overwrite_dset(data_grp, 'frame_endmembers', (n_frames, n_bands, num_endmembers), dtype='int16', spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=(1, n_bands, num_endmembers))
+            em_ds = overwrite_dset(data_grp, 'frame_endmembers', (n_frames, n_bands, num_endmembers), dtype='float32', fillvalue=np.nan, spatial_ref=spatial_ref, geo_transform=geo_transform, chunks=(1, n_bands, num_endmembers))
             if 'wavelengths' in data_grp["surface_reflectance"].attrs:
                 em_ds.attrs['wavelengths'] = data_grp["surface_reflectance"].attrs['wavelengths']
 
-            idx_ds = overwrite_dset(data_grp, 'frame_endmember_indices', (n_frames, num_endmembers), dtype='int32', chunks=(1, num_endmembers))
-            vol_ds = overwrite_dset(data_grp, 'frame_endmember_volumes', (n_frames, num_endmembers), dtype='int16', chunks=(1, num_endmembers))
+            idx_ds = overwrite_dset(data_grp, 'frame_endmember_indices', (n_frames, num_endmembers), dtype='int32',fillvalue=-9999, chunks=(1, num_endmembers))
+            vol_ds = overwrite_dset(data_grp, 'frame_endmember_volumes', (n_frames, num_endmembers), dtype='float32',fillvalue=np.nan, chunks=(1, num_endmembers))
 
             sensor_dsets[grid] = {'em': em_ds, 'idx': idx_ds, 'vol': vol_ds, 'num_bands': n_bands}
 
@@ -339,7 +314,7 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
 
             data_grp = h5_file[f"/HDFEOS/GRIDS/{grid_name}/Data Fields"]
             sr_dataset = data_grp["surface_reflectance"]
-            frame_sr = read_scaled_int16(sr_dataset, np.s_[t_local, ...])
+            frame_sr = load_scaled_reflectance(sr_dataset, np.s_[t_local, ...])
             frame_mask = data_grp["common_mask"][t_local, ...].copy()
             raw_frame_ortho = data_grp["ortho_visual"][t_local, ...]
 
@@ -354,11 +329,17 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
 
             if frame_ortho.dtype != np.uint8:
                 fo = frame_ortho.astype(np.float32)
-                valid_ortho = fo > -9000
+                ortho_ds = data_grp["ortho_visual"]
+                ortho_fill = ortho_ds.attrs.get("_FillValue", ortho_ds.attrs.get("fillvalue", getattr(ortho_ds, "fillvalue", None)))
+                if ortho_fill is not None and not np.isnan(ortho_fill):
+                    valid_ortho = ~np.isclose(fo, ortho_fill, equal_nan=True) & ~np.isnan(fo)
+                else:
+                    valid_ortho = ~np.isnan(fo)
                 if np.any(valid_ortho):
                     p1, p99 = np.percentile(fo[valid_ortho], (1, 99))
                     if p99 > p1:
                         fo[valid_ortho] = (fo[valid_ortho] - p1) / (p99 - p1)
+                fo[~valid_ortho] = 0.0
                 frame_ortho = np.clip(fo * 255, 0, 255).astype(np.uint8)
 
             gw_attr = data_grp["surface_reflectance"].attrs.get("all_good_wavelengths")
@@ -369,7 +350,7 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
                 gw_mask = None
                 eval_sr = frame_sr
 
-            em, em_idx, vol_curve = process_volume_frame(eval_sr, num_endmembers, 'minEndmember', norm_param)
+            em, em_idx, vol_curve = process_volume_frame(eval_sr, num_endmembers)
 
             if gw_mask is not None:
                 em_full = np.full((sensor_dsets[grid_name]['num_bands'], num_endmembers), np.nan, dtype=np.float32)
@@ -378,22 +359,44 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
             else:
                 em_out = em
 
-            sensor_dsets[grid_name]['em'][t_local, ...] = scale_to_int16(em_out)
+            sensor_dsets[grid_name]['em'][t_local, ...] = em_out
             sensor_dsets[grid_name]['idx'][t_local, ...] = em_idx
-            sensor_dsets[grid_name]['vol'][t_local, ...] = scale_to_int16(vol_curve)
+            sensor_dsets[grid_name]['vol'][t_local, ...] = vol_curve
 
-            slide_map = sc.process_volume_sliding_tile(frame_sr, tile_size=tile_size, stride=1, num_endmembers=num_endmembers)
-            ds_harm_slide[global_idx, ...] = scale_to_int16(slide_map)
+            slide_map = sc.process_volume_sliding_tile(eval_sr, tile_size=tile_size, stride=1, num_endmembers=num_endmembers)
+            ds_harm_slide[global_idx, ...] = slide_map
 
             valid_mask = (frame_mask == 0)
             z_map, global_mean, global_std = sc.calculate_global_z_score(slide_map, valid_mask)
-            ds_harm_z[global_idx, ...] = scale_to_int16(z_map)
+            ds_harm_z[global_idx, ...] = z_map
 
             global_means_list.append(global_mean)
             global_stds_list.append(global_std)
 
             ds_harm_mask[global_idx, ...] = frame_mask
             ds_harm_ortho[global_idx, ...] = frame_ortho
+
+            wavelengths = data_grp["surface_reflectance"].attrs.get("wavelengths")
+            if wavelengths is not None:
+                wl = np.asarray(wavelengths)
+                # Account for nanometers vs micrometers
+                scale_wl = 1000.0 if np.nanmax(wl) < 10.0 else 1.0
+                red_target, nir_target = 665.0, 865.0
+                red_idx = int(np.nanargmin(np.abs(wl * scale_wl - red_target)))
+                nir_idx = int(np.nanargmin(np.abs(wl * scale_wl - nir_target)))
+            else:
+                if "HLSS30" in grid_name:
+                    red_idx, nir_idx = 3, 7
+                elif "HLSL30" in grid_name:
+                    red_idx, nir_idx = 3, 4
+                elif "TANAGER" in grid_name:
+                    red_idx, nir_idx = 59, 97
+                else:
+                    red_idx = min(3, frame_sr.shape[0] - 1)
+                    nir_idx = min(4, frame_sr.shape[0] - 1)
+
+            ndvi = sc.calc_ndvi_frame(frame_sr, red_idx, nir_idx)
+            ds_harm_ndvi[global_idx, ...] = ndvi
 
             duration = time.perf_counter() - t_start_frame
             print(f"  [{global_idx + 1}/{total_frames}] {grid_name} (Global Index {global_idx}) processed in {duration:.2f}s")
@@ -405,7 +408,7 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
         prov_time = np.array([m['time'] for m in timeline], dtype='float64')
         prov_idx = np.array([m['local_idx'] for m in timeline], dtype='int32')
 
-        created_harm_dsets = [ds_harm_mask, ds_harm_ortho, ds_harm_slide, ds_harm_z]
+        created_harm_dsets = [ds_harm_mask, ds_harm_ortho, ds_harm_slide, ds_harm_z, ds_harm_ndvi]
         for ds in created_harm_dsets:
             ds.attrs.create('source_grid', data=prov_grid)
             ds.attrs.create('source_spacecraft', data=prov_space)
@@ -425,6 +428,8 @@ def process_ard_cube(filepath, tile_size=3, num_endmembers=7, norm_param=None):
                 ds.attrs['MASK_SOURCE'] = "HARMONIZED_common_mask"
                 ds.attrs['frame_global_means'] = np.array(global_means_list, dtype=np.float32)
                 ds.attrs['frame_global_stds'] = np.array(global_stds_list, dtype=np.float32)
+            elif ds.name.endswith('ndvi'):
+                ds.attrs['description'] = "Harmonized Normalized Difference Vegetation Index (NDVI)" 
 
         for grid in grids:
             dsets = sensor_dsets[grid]

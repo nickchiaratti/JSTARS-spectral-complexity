@@ -20,28 +20,22 @@ import math
 import warnings
 from pathlib import Path
 from datetime import datetime, timezone
+import numpy as np
 
 # Windows WMI query bypass to prevent subprocess hangs
 def _dummy_wmi_query(*args, **kwargs):
     raise OSError("WMI disabled to prevent hangs")
 platform._wmi_query = _dummy_wmi_query
 
-import numpy as np
 import h5py
 
-def scale_to_int16(arr, scale_factor=10000, nodata_val=-9999):
-    import numpy as np
+
+
+def scale_to_int16(arr, scale_factor, nodata_val):
     out = np.full(arr.shape, nodata_val, dtype=np.int16)
     valid = ~np.isnan(arr) & (arr != nodata_val)
-    clipped = np.clip(arr[valid] * scale_factor, -32767, 32767)
-    out[valid] = np.round(clipped).astype(np.int16)
-    return out
-
-def read_scaled_int16(arr, scale_factor=10000, nodata_val=-9999):
-    import numpy as np
-    out = np.full(arr.shape, np.nan, dtype=np.float32)
-    valid = (arr != nodata_val)
-    out[valid] = arr[valid].astype(np.float32) / float(scale_factor)
+    scaled = np.round(arr[valid] * scale_factor)
+    out[valid] = scaled.astype(np.int16)
     return out
 
 import rasterio
@@ -53,10 +47,16 @@ import scipy.ndimage
 import yaml
 import hdfeos_odl
 
+# Expose ODL grid generation functions at module level
+generate_hls_odl_grid_string = hdfeos_odl.generate_hls_odl_grid_string
+generate_dynamic_odl_grid_string = hdfeos_odl.generate_dynamic_odl_grid_string
+
 
 # =====================================================================
 # CONSTANTS AND SENTINEL VALUES
 # =====================================================================
+SR_NODATA = np.nan
+ANGLE_NODATA = np.nan
 TARGET_RESOLUTION = 30.0
 MIN_HLS_ROI_COVERAGE_PERCENT = 20.0
 MIN_TANAGER_ROI_COVERAGE_PERCENT = 25.0
@@ -64,9 +64,15 @@ SUN_ELEVATION_THRESHOLD = 20
 TANAGER_SUN_ELEVATION_THRESHOLD = 30
 
 # HLS Sentinels
-HLS_SR_NODATA = -9999
 HLS_FMASK_NODATA = 255
-HLS_ANGLES_NODATA = 40000
+HLS_FILL_VALUE_REFLECTANCE_RAW = -9999
+HLS_SCALE_FACTOR_REFLECTANCE = 0.0001
+HLS_FILL_VALUE_ANGLES_RAW = 40000
+HLS_SCALE_FACTOR_ANGLES = 0.01
+
+# Backward Compatibility Sentinel Aliases
+HLS_SR_NODATA = HLS_FILL_VALUE_REFLECTANCE_RAW
+HLS_ANGLES_NODATA = HLS_FILL_VALUE_ANGLES_RAW
 
 # Tanager Sentinels
 TANAGER_NODATA = -9999.0
@@ -246,9 +252,6 @@ def get_tanager_mask(
         if "sun_zenith" in data_grp:
             zenith_dset = data_grp["sun_zenith"]
             zenith = zenith_dset[f_idx, ...]
-            if hasattr(zenith_dset, "attrs") and "scale_factor" in zenith_dset.attrs:
-                zenith = read_scaled_int16(zenith, scale_factor=zenith_dset.attrs["scale_factor"], nodata_val=zenith_dset.attrs["_FillValue"])
-            
             sun_invalid = (zenith == TANAGER_NODATA) | np.isnan(zenith)
             if sun_elevation_threshold is not None:
                 sun_invalid |= (zenith > (90.0 - sun_elevation_threshold))
@@ -257,9 +260,6 @@ def get_tanager_mask(
         if "aerosol_optical_depth" in data_grp:
             aod_dset = data_grp["aerosol_optical_depth"]
             aod = aod_dset[f_idx, ...]
-            if hasattr(aod_dset, "attrs") and "scale_factor" in aod_dset.attrs:
-                aod = read_scaled_int16(aod, scale_factor=aod_dset.attrs["scale_factor"], nodata_val=aod_dset.attrs["_FillValue"])
-                
             bad_aod = (aod == TANAGER_NODATA) | np.isnan(aod)
             if aerosol_depth_threshold is not None:
                 bad_aod |= (aod >= aerosol_depth_threshold)
@@ -278,9 +278,6 @@ def get_tanager_mask(
                 unc_cube = unc_dset[f_idx, valid_bands, ...]
             else:
                 unc_cube = unc_dset[f_idx, ...]
-                
-            if hasattr(unc_dset, "attrs") and "scale_factor" in unc_dset.attrs:
-                unc_cube = read_scaled_int16(unc_cube, scale_factor=unc_dset.attrs["scale_factor"], nodata_val=unc_dset.attrs["_FillValue"])
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -318,8 +315,8 @@ def get_tanager_mask(
 
 def generate_rgba_image(
     r_band,
-    g_band,
-    b_band,
+    g_band=None,
+    b_band=None,
     valid_mask=None,
     low=0.5,
     high=99.5,
@@ -334,6 +331,15 @@ def generate_rgba_image(
     Returns:
         rgba_8bit: uint8 array of shape (H, W, 4) with alpha=255 for valid, alpha=0 for invalid.
     """
+    if g_band is None and b_band is None:
+        cube = np.asarray(r_band)
+        if cube.ndim == 3 and cube.shape[0] == 3:
+            r_band, g_band, b_band = cube[0], cube[1], cube[2]
+        elif cube.ndim == 3 and cube.shape[-1] == 3:
+            r_band, g_band, b_band = cube[..., 0], cube[..., 1], cube[..., 2]
+        else:
+            raise ValueError(f"Expected 3-band cube with shape (3, H, W) or (H, W, 3), got shape {cube.shape}")
+
     r = np.asarray(r_band, dtype=np.float32)
     g = np.asarray(g_band, dtype=np.float32)
     b = np.asarray(b_band, dtype=np.float32)
@@ -530,12 +536,57 @@ def process_hls_master_stack(
     if len(sorted_dates) == 0:
         return None
 
+    # Read native metadata attributes from the first entry to configure dataset parameters
+    first_date = sorted_dates[0]
+    first_entry = daily_groups[first_date][0]
+    first_grid_id = first_entry["grid_id"]
+    first_df_path = f"HDFEOS/GRIDS/{first_grid_id}/Data Fields"
+    with h5py.File(native_h5_path, "r") as h5f_meta:
+        sr_meta = h5f_meta[f"{first_df_path}/surface_reflectance"]
+        fm_meta = h5f_meta[f"{first_df_path}/Fmask"]
+        ag_meta = h5f_meta[f"{first_df_path}/solar_view_angles"]
+
+        # 1. Surface Reflectance: Fail explicitly if mandatory metadata is missing
+        if "_FillValue" not in sr_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute '_FillValue' on {sr_meta.name}")
+        sr_src_nodata = int(sr_meta.attrs["_FillValue"])
+        sr_src_dtype = sr_meta.dtype
+
+        if "scale_to_float" not in sr_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute 'scale_to_float' on {sr_meta.name}")
+        sr_src_scale_to_float = float(sr_meta.attrs["scale_to_float"])
+
+        if "scale_factor" not in sr_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute 'scale_factor' on {sr_meta.name}")
+        sr_src_scale_factor = float(sr_meta.attrs["scale_factor"])
+
+        # 2. Fmask
+        if "_FillValue" not in fm_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute '_FillValue' on {fm_meta.name}")
+        fm_src_nodata = int(fm_meta.attrs["_FillValue"])
+        fm_src_dtype = fm_meta.dtype
+
+        # 3. Solar and View Angles
+        if "_FillValue" not in ag_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute '_FillValue' on {ag_meta.name}")
+        ag_src_nodata = int(ag_meta.attrs["_FillValue"])
+        ag_src_dtype = ag_meta.dtype
+
+        if "scale_to_float" not in ag_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute 'scale_to_float' on {ag_meta.name}")
+        ag_src_scale_to_float = float(ag_meta.attrs["scale_to_float"])
+
+        if "scale_factor" not in ag_meta.attrs:
+            raise KeyError(f"Missing mandatory attribute 'scale_factor' on {ag_meta.name}")
+        ag_src_scale_factor = float(ag_meta.attrs["scale_factor"])
+
     # ---- PASS 1: Identify Valid Dates with Sufficient Coverage ----
     valid_dates = []
     with h5py.File(native_h5_path, "r") as h5f:
         for date_str in sorted_dates:
             entries = daily_groups[date_str]
-            accum_sr_band0 = np.full((1, master_height, master_width), np.nan, dtype=np.float32)
+
+            accum_sr_band0 = np.full((1, master_height, master_width), SR_NODATA, dtype=np.float32)
 
             for entry in entries:
                 fidx = entry["frame_idx"]
@@ -547,7 +598,7 @@ def process_hls_master_stack(
                 src_crs = CRS.from_wkt(sr_node.attrs["spatial_ref"])
 
                 src_sr = sr_node[fidx, 0:1, :, :]
-                tmp_sr_band0 = np.full((1, master_height, master_width), np.nan, dtype=np.float32)
+                tmp_sr_band0 = np.full((1, master_height, master_width), SR_NODATA, dtype=np.float32)
                 reproject(
                     source=src_sr,
                     destination=tmp_sr_band0,
@@ -556,8 +607,8 @@ def process_hls_master_stack(
                     dst_transform=master_transform,
                     dst_crs=master_crs,
                     resampling=Resampling.nearest,
-                    src_nodata=np.nan,
-                    dst_nodata=np.nan
+                    src_nodata=sr_src_nodata,
+                    dst_nodata=SR_NODATA
                 )
 
                 mask_sr = ~np.isnan(tmp_sr_band0)
@@ -573,11 +624,6 @@ def process_hls_master_stack(
         return None
 
     # ---- PASS 2: Reproject and Write Valid Dates ----
-    grp = out_h5f.create_group(out_group_path)
-    if tile_mapping_json is not None:
-        import json
-        grp.attrs["tile_mapping"] = json.dumps(tile_mapping_json)
-
     chunk_h = min(master_height, 256)
     chunk_w = min(master_width, 256)
     
@@ -586,55 +632,75 @@ def process_hls_master_stack(
         dtype="float64"
     )
 
-    sr_ds = grp.create_dataset(
-        "surface_reflectance", 
-        shape=(num_valid, expected_sr, master_height, master_width), 
-        dtype="int16", 
-        shuffle=True, compression="gzip", compression_opts=6, chunks=(1, 1, chunk_h, chunk_w)
-    )
-    sr_ds.attrs["_FillValue"] = -32768
-    sr_ds.attrs["scale_factor"] = 10000.0
-    sr_ds.attrs["spatial_ref"] = master_crs.to_wkt()
-    sr_ds.attrs["GeoTransform"] = gdal_transform
-    if wavelengths is not None:
-        sr_ds.attrs["wavelengths"] = wavelengths
-    
-    fmask_ds = grp.create_dataset(
-        "Fmask", 
-        shape=(num_valid, master_height, master_width), 
-        dtype="uint8", 
-        shuffle=True, compression="gzip", compression_opts=6, chunks=(1, chunk_h, chunk_w)
-    )
-    fmask_ds.attrs["_FillValue"] = HLS_FMASK_NODATA
-    
-    ang_ds = grp.create_dataset(
-        "solar_view_angles", 
-        shape=(num_valid, 4, master_height, master_width), 
-        dtype="int16", 
-        shuffle=True, compression="gzip", compression_opts=6, chunks=(1, 4, chunk_h, chunk_w)
-    )
-    ang_ds.attrs["_FillValue"] = -32768
-    ang_ds.attrs["scale_factor"] = 10000.0
-    ang_ds.attrs["band_order"] = ["SZA", "SAA", "VZA", "VAA"]
-    
-    vis_ds = grp.create_dataset(
-        "ortho_visual", 
-        shape=(num_valid, 4, master_height, master_width), 
-        dtype="uint8", 
-        shuffle=True, compression="gzip", compression_opts=6, chunks=(1, 4, chunk_h, chunk_w)
-    )
-    vis_ds.attrs["spatial_ref"] = master_crs.to_wkt()
-    vis_ds.attrs["GeoTransform"] = gdal_transform
-    
-    mask_ds = grp.create_dataset(
-        "common_mask", 
-        shape=(num_valid, master_height, master_width), 
-        dtype=bool, 
-        shuffle=True, compression="gzip", compression_opts=6, chunks=(1, chunk_h, chunk_w)
-    )
-    mask_ds.attrs["description"] = "True = Invalid/Masked, False = Valid."
-    mask_ds.attrs["spatial_ref"] = master_crs.to_wkt()
-    mask_ds.attrs["GeoTransform"] = gdal_transform
+    if out_h5f is not None:
+        grp = out_h5f.create_group(out_group_path)
+        if tile_mapping_json is not None:
+            import json
+            grp.attrs["tile_mapping"] = json.dumps(tile_mapping_json)
+
+        sr_ds = grp.create_dataset(
+            "surface_reflectance", 
+            shape=(num_valid, expected_sr, master_height, master_width), 
+            dtype=sr_src_dtype, 
+            fillvalue=sr_src_nodata,
+            shuffle=True, compression="gzip", compression_opts=6, chunks=(1, 1, chunk_h, chunk_w)
+        )
+        sr_ds.attrs["units"] = "Reflectance"
+        sr_ds.attrs["_FillValue"] = sr_src_nodata
+        sr_ds.attrs["scale_to_float"] = sr_src_scale_to_float
+        sr_ds.attrs["scale_factor"] = sr_src_scale_factor
+        sr_ds.attrs["spatial_ref"] = master_crs.to_wkt()
+        sr_ds.attrs["GeoTransform"] = gdal_transform
+        if wavelengths is not None:
+            sr_ds.attrs["wavelengths"] = wavelengths
+        
+        fmask_ds = grp.create_dataset(
+            "Fmask", 
+            shape=(num_valid, master_height, master_width), 
+            dtype="uint8", 
+            fillvalue=fm_src_nodata,
+            shuffle=True, compression="gzip", compression_opts=6, chunks=(1, chunk_h, chunk_w)
+        )
+        fmask_ds.attrs["units"] = "Bit Flags"
+        fmask_ds.attrs["_FillValue"] = fm_src_nodata
+        
+        ang_ds = grp.create_dataset(
+            "solar_view_angles", 
+            shape=(num_valid, 4, master_height, master_width), 
+            dtype=ag_src_dtype, 
+            fillvalue=ag_src_nodata,
+            shuffle=True, compression="gzip", compression_opts=6, chunks=(1, 4, chunk_h, chunk_w)
+        )
+        ang_ds.attrs["units"] = "Degrees"
+        ang_ds.attrs["_FillValue"] = ag_src_nodata
+        ang_ds.attrs["scale_to_float"] = ag_src_scale_to_float
+        ang_ds.attrs["scale_factor"] = ag_src_scale_factor
+        ang_ds.attrs["band_order"] = ["SZA", "SAA", "VZA", "VAA"]
+        
+        vis_ds = grp.create_dataset(
+            "ortho_visual", 
+            shape=(num_valid, 4, master_height, master_width), 
+            dtype="uint8", 
+            shuffle=True, compression="gzip", compression_opts=6, chunks=(1, 4, chunk_h, chunk_w)
+        )
+        vis_ds.attrs["spatial_ref"] = master_crs.to_wkt()
+        vis_ds.attrs["GeoTransform"] = gdal_transform
+        
+        mask_ds = grp.create_dataset(
+            "common_mask", 
+            shape=(num_valid, master_height, master_width), 
+            dtype=bool, 
+            shuffle=True, compression="gzip", compression_opts=6, chunks=(1, chunk_h, chunk_w)
+        )
+        mask_ds.attrs["description"] = "True = Invalid/Masked, False = Valid."
+        mask_ds.attrs["spatial_ref"] = master_crs.to_wkt()
+        mask_ds.attrs["GeoTransform"] = gdal_transform
+    else:
+        sr_ds = np.full((num_valid, expected_sr, master_height, master_width), sr_src_nodata, dtype=sr_src_dtype)
+        fmask_ds = np.full((num_valid, master_height, master_width), fm_src_nodata, dtype="uint8")
+        ang_ds = np.full((num_valid, 4, master_height, master_width), ag_src_nodata, dtype=ag_src_dtype)
+        vis_ds = np.full((num_valid, 4, master_height, master_width), 0, dtype="uint8")
+        mask_ds = np.full((num_valid, master_height, master_width), True, dtype=bool)
 
     meta_arrays = {"acq": [], "space": [], "saz": [], "sel": [], "cc": []}
     
@@ -652,9 +718,9 @@ def process_hls_master_stack(
             meta_arrays["space"].append(spacecraft_str)
             meta_arrays["cc"].append(h5f[base_path].attrs["cloud_cover"][base_fidx])
 
-            frame_sr = np.full((expected_sr, master_height, master_width), np.nan, dtype=np.float32)
-            frame_fm = np.full((master_height, master_width), HLS_FMASK_NODATA, dtype=np.uint8)
-            frame_ag = np.full((4, master_height, master_width), np.nan, dtype=np.float32)
+            frame_sr = np.full((expected_sr, master_height, master_width), sr_src_nodata, dtype=sr_src_dtype)
+            frame_fm = np.full((master_height, master_width), fm_src_nodata, dtype=np.uint8)
+            frame_ag = np.full((4, master_height, master_width), ag_src_nodata, dtype=ag_src_dtype)
             
             for entry in entries:
                 fidx = entry["frame_idx"]
@@ -666,7 +732,7 @@ def process_hls_master_stack(
                 src_crs = CRS.from_wkt(sr_node.attrs["spatial_ref"])
 
                 src_sr = sr_node[fidx]
-                tmp_sr = np.full((expected_sr, master_height, master_width), np.nan, dtype=np.float32)
+                tmp_sr = np.full((expected_sr, master_height, master_width), sr_src_nodata, dtype=sr_src_dtype)
                 reproject(
                     source=src_sr,
                     destination=tmp_sr,
@@ -675,10 +741,10 @@ def process_hls_master_stack(
                     dst_transform=master_transform,
                     dst_crs=master_crs,
                     resampling=Resampling.nearest,
-                    src_nodata=np.nan,
-                    dst_nodata=np.nan
+                    src_nodata=sr_src_nodata,
+                    dst_nodata=sr_src_nodata
                 )
-                mask_sr = ~np.isnan(tmp_sr)
+                mask_sr = (tmp_sr != sr_src_nodata)
                 frame_sr[mask_sr] = tmp_sr[mask_sr]
 
                 src_fm = h5f[f"{df_path}/Fmask"][fidx]
@@ -686,7 +752,7 @@ def process_hls_master_stack(
                     src_fm = src_fm[0]
                 elif src_fm.ndim > 2:
                     src_fm = np.squeeze(src_fm)
-                tmp_fm = np.full((master_height, master_width), HLS_FMASK_NODATA, dtype=np.uint8)
+                tmp_fm = np.full((master_height, master_width), fm_src_nodata, dtype=np.uint8)
                 reproject(
                     source=src_fm,
                     destination=tmp_fm,
@@ -695,14 +761,14 @@ def process_hls_master_stack(
                     dst_transform=master_transform,
                     dst_crs=master_crs,
                     resampling=Resampling.nearest,
-                    src_nodata=HLS_FMASK_NODATA,
-                    dst_nodata=HLS_FMASK_NODATA
+                    src_nodata=fm_src_nodata,
+                    dst_nodata=fm_src_nodata
                 )
-                mask_fm = (tmp_fm != HLS_FMASK_NODATA)
+                mask_fm = (tmp_fm != fm_src_nodata)
                 frame_fm[mask_fm] = tmp_fm[mask_fm]
 
                 src_ag = h5f[f"{df_path}/solar_view_angles"][fidx]
-                tmp_ag = np.full((4, master_height, master_width), np.nan, dtype=np.float32)
+                tmp_ag = np.full((4, master_height, master_width), ag_src_nodata, dtype=ag_src_dtype)
                 reproject(
                     source=src_ag,
                     destination=tmp_ag,
@@ -711,21 +777,29 @@ def process_hls_master_stack(
                     dst_transform=master_transform,
                     dst_crs=master_crs,
                     resampling=Resampling.nearest,
-                    src_nodata=np.nan,
-                    dst_nodata=np.nan
+                    src_nodata=ag_src_nodata,
+                    dst_nodata=ag_src_nodata
                 )
-                mask_ag = ~np.isnan(tmp_ag)
+                mask_ag = (tmp_ag != ag_src_nodata)
                 frame_ag[mask_ag] = tmp_ag[mask_ag]
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
-                mean_sza = np.nanmean(frame_ag[0])
-                mean_saa = np.nanmean(frame_ag[1])
+                valid_sza = (frame_ag[0] != ag_src_nodata)
+                valid_saa = (frame_ag[1] != ag_src_nodata)
+                mean_sza = float(np.mean(frame_ag[0, valid_sza]) * ag_src_scale_to_float) if np.any(valid_sza) else 0.0
+                mean_saa = float(np.mean(frame_ag[1, valid_saa]) * ag_src_scale_to_float) if np.any(valid_saa) else 0.0
 
             meta_arrays["saz"].append(mean_saa)
             meta_arrays["sel"].append(90.0 - mean_sza)
 
-            temp_grp = {"Fmask": frame_fm[np.newaxis, ...], "solar_view_angles": frame_ag[np.newaxis, ...]}
+            # Convert integer angles to float degrees for mask evaluation
+            frame_ag_float = np.where(
+                frame_ag != ag_src_nodata,
+                frame_ag.astype(np.float32) * ag_src_scale_to_float,
+                np.nan
+            )
+            temp_grp = {"Fmask": frame_fm[np.newaxis, ...], "solar_view_angles": frame_ag_float[np.newaxis, ...]}
             frame_mask = get_hls_mask(
                 temp_grp,
                 0,
@@ -736,35 +810,60 @@ def process_hls_master_stack(
                 return_valid=False
             ).astype(bool)
 
+            # Convert integer reflectance to float for visual generation
+            if np.issubdtype(frame_sr.dtype, np.integer):
+                frame_sr_float = np.where(
+                    frame_sr != sr_src_nodata,
+                    frame_sr.astype(np.float32) * sr_src_scale_to_float,
+                    np.nan
+                )
+            else:
+                frame_sr_float = frame_sr
+
             rgba_img = generate_rgba_image(
-                r_band=frame_sr[3, :, :],
-                g_band=frame_sr[2, :, :],
-                b_band=frame_sr[1, :, :],
-                valid_mask=~frame_mask
+                r_band=frame_sr_float[3, :, :],
+                g_band=frame_sr_float[2, :, :],
+                b_band=frame_sr_float[1, :, :],
+                valid_mask=(~frame_mask)
             )
             vis_frame = np.transpose(rgba_img, (2, 0, 1))
 
-            sr_ds[idx] = scale_to_int16(frame_sr)
+            # Store raw reprojected integer arrays directly into datasets matching source datatypes
+            sr_ds[idx] = frame_sr
             fmask_ds[idx] = frame_fm
-            ang_ds[idx] = scale_to_int16(frame_ag)
+            ang_ds[idx] = frame_ag
             vis_ds[idx] = vis_frame
             mask_ds[idx] = frame_mask
 
-    sr_ds.attrs["acquisition_time"] = np.array(meta_arrays["acq"], dtype="float64")
-    sr_ds.attrs["spacecraft_id"] = np.array(meta_arrays["space"], dtype="S")
-    sr_ds.attrs["sun_azimuth"] = np.array(meta_arrays["saz"], dtype="int16")
-    sr_ds.attrs["sun_elevation"] = np.array(meta_arrays["sel"], dtype="int16")
-    sr_ds.attrs["cloud_cover"] = np.array(meta_arrays["cc"], dtype="int16")
-
-    return num_valid
+    if out_h5f is not None:
+        sr_ds.attrs["acquisition_time"] = np.array(meta_arrays["acq"], dtype="float64")
+        sr_ds.attrs["spacecraft_id"] = np.array(meta_arrays["space"], dtype="S")
+        sr_ds.attrs["sun_azimuth"] = np.array(meta_arrays["saz"], dtype="float32")
+        sr_ds.attrs["sun_elevation"] = np.array(meta_arrays["sel"], dtype="float32")
+        sr_ds.attrs["cloud_cover"] = np.array(meta_arrays["cc"], dtype="float32")
+        return num_valid
+    else:
+        return {
+            "count": num_valid,
+            "sr": sr_ds,
+            "fm": fmask_ds[:, np.newaxis, :, :],
+            "ag": ang_ds,
+            "vis": vis_ds,
+            "mask": mask_ds,
+            "meta": meta_arrays
+        }
 
 
 def write_hdf_sensor_group(h5f, group_path, data_dict, wavelengths, crs, transform, tile_mapping_json=None):
-    """Writes reprojected HLS datasets into HDF-EOS compliant group."""
-    if not data_dict or data_dict["count"] == 0:
+    """Writes reprojected sensor datasets into an HDF-EOS compliant group."""
+    if not data_dict or data_dict.get("count", 0) == 0:
         return
 
     grp = h5f.create_group(group_path)
+    if tile_mapping_json is not None:
+        import json
+        grp.attrs["tile_mapping"] = json.dumps(tile_mapping_json)
+
     gdal_transform = np.array(
         [transform.c, transform.a, transform.b, transform.f, transform.d, transform.e],
         dtype="float64"
@@ -774,31 +873,60 @@ def write_hdf_sensor_group(h5f, group_path, data_dict, wavelengths, crs, transfo
     num_frames, bands, h, w = data_dict["sr"].shape
     chunk_h, chunk_w = min(h, 256), min(w, 256)
 
+    sr_arr = data_dict["sr"]
+    sr_fill = np.nan if np.issubdtype(sr_arr.dtype, np.floating) else HLS_FILL_VALUE_REFLECTANCE_RAW
+
+    meta = data_dict.get("meta", {})
+
     # 1. Surface Reflectance
     sr_ds = grp.create_dataset(
         "surface_reflectance",
-        data=scale_to_int16(data_dict["sr"]),
+        data=sr_arr,
+        dtype=sr_arr.dtype,
+        fillvalue=sr_fill,
         shuffle=True, compression="gzip",
         compression_opts=6,
         chunks=(1, bands, chunk_h, chunk_w)
     )
     sr_ds.attrs["units"] = "Reflectance"
-    sr_ds.attrs["_FillValue"] = -32768
-    sr_ds.attrs["scale_factor"] = 10000.0
+    sr_ds.attrs["_FillValue"] = sr_fill
+    if "sr_scale_factor" in meta:
+        sr_ds.attrs["scale_factor"] = meta["sr_scale_factor"]
+    elif "scale_factor" in meta:
+        sr_ds.attrs["scale_factor"] = meta["scale_factor"]
+    elif np.issubdtype(sr_arr.dtype, np.integer):
+        raise KeyError("Integer surface_reflectance supplied without mandatory 'scale_factor' in metadata.")
+
+    if "sr_scale_to_float" in meta:
+        sr_ds.attrs["scale_to_float"] = meta["sr_scale_to_float"]
+    elif "scale_to_float" in meta:
+        sr_ds.attrs["scale_to_float"] = meta["scale_to_float"]
+    elif np.issubdtype(sr_arr.dtype, np.integer):
+        raise KeyError("Integer surface_reflectance supplied without mandatory 'scale_to_float' in metadata.")
+
     sr_ds.attrs["wavelengths"] = wavelengths
     sr_ds.attrs["spatial_ref"] = crs.to_wkt()
     sr_ds.attrs["GeoTransform"] = gdal_transform
-    sr_ds.attrs.create("spacecraft_id", data=data_dict["meta"]["space"], dtype=dt)
-    sr_ds.attrs["acquisition_time"] = np.array(data_dict["meta"]["acq"], dtype="float64")
-    sr_ds.attrs["sun_azimuth"] = np.array(data_dict["meta"]["saz"], dtype="int16")
-    sr_ds.attrs["sun_elevation"] = np.array(data_dict["meta"]["sel"], dtype="int16")
-    sr_ds.attrs["cloud_cover"] = np.array(data_dict["meta"]["cc"], dtype="int16")
+    if meta:
+        if "space" in meta:
+            sr_ds.attrs.create("spacecraft_id", data=meta["space"], dtype=dt)
+        if "acq" in meta:
+            sr_ds.attrs["acquisition_time"] = np.array(meta["acq"], dtype="float64")
+        if "saz" in meta:
+            sr_ds.attrs["sun_azimuth"] = np.array(meta["saz"], dtype="float32")
+        if "sel" in meta:
+            sr_ds.attrs["sun_elevation"] = np.array(meta["sel"], dtype="float32")
+        if "cc" in meta:
+            sr_ds.attrs["cloud_cover"] = np.array(meta["cc"], dtype="float32")
 
     # 2. Fmask
+    fm_arr = data_dict["fm"]
+    fm_2d = fm_arr[:, 0, :, :] if fm_arr.ndim == 4 else fm_arr
     fmask_ds = grp.create_dataset(
         "Fmask",
-        data=data_dict["fm"][:, 0, :, :],
+        data=fm_2d,
         dtype="uint8",
+        fillvalue=HLS_FMASK_NODATA,
         shuffle=True, compression="gzip",
         compression_opts=6,
         chunks=(1, chunk_h, chunk_w)
@@ -806,15 +934,32 @@ def write_hdf_sensor_group(h5f, group_path, data_dict, wavelengths, crs, transfo
     fmask_ds.attrs["_FillValue"] = HLS_FMASK_NODATA
 
     # 3. Solar View Angles
+    ag_arr = data_dict["ag"]
+    ag_fill = np.nan if np.issubdtype(ag_arr.dtype, np.floating) else HLS_FILL_VALUE_ANGLES_RAW
     ang_ds = grp.create_dataset(
         "solar_view_angles",
-        data=scale_to_int16(data_dict["ag"]),
+        data=ag_arr,
+        dtype=ag_arr.dtype,
+        fillvalue=ag_fill,
         shuffle=True, compression="gzip",
         compression_opts=6,
         chunks=(1, 4, chunk_h, chunk_w)
     )
-    ang_ds.attrs["_FillValue"] = -32768
-    ang_ds.attrs["scale_factor"] = 10000.0
+    ang_ds.attrs["_FillValue"] = ag_fill
+    if "ag_scale_factor" in meta:
+        ang_ds.attrs["scale_factor"] = meta["ag_scale_factor"]
+    elif "angles_scale_factor" in meta:
+        ang_ds.attrs["scale_factor"] = meta["angles_scale_factor"]
+    elif np.issubdtype(ag_arr.dtype, np.integer):
+        raise KeyError("Integer solar_view_angles supplied without mandatory 'scale_factor' in metadata.")
+
+    if "ag_scale_to_float" in meta:
+        ang_ds.attrs["scale_to_float"] = meta["ag_scale_to_float"]
+    elif "angles_scale_to_float" in meta:
+        ang_ds.attrs["scale_to_float"] = meta["angles_scale_to_float"]
+    elif np.issubdtype(ag_arr.dtype, np.integer):
+        raise KeyError("Integer solar_view_angles supplied without mandatory 'scale_to_float' in metadata.")
+
     ang_ds.attrs["band_order"] = ["SZA", "SAA", "VZA", "VAA"]
 
     # 4. Ortho Visual
@@ -845,6 +990,7 @@ def write_hdf_sensor_group(h5f, group_path, data_dict, wavelengths, crs, transfo
     mask_ds.attrs["cloud_dilation"] = HLS_CLOUD_DILATION
     mask_ds.attrs["aerosol_accept_level"] = AEROSOL_ACCEPT_LEVEL
     mask_ds.attrs["sun_elevation_threshold"] = SUN_ELEVATION_THRESHOLD
+    return grp
 
 
 # =====================================================================
@@ -914,7 +1060,9 @@ def process_tanager_swaths_to_grid(
         for name in src_df.keys():
             src_dset = src_df[name]
             original_dtype = src_dset.dtype
-            original_fill = src_dset.attrs.get("_FillValue", TANAGER_NODATA)
+            if "_FillValue" not in src_dset.attrs:
+                raise KeyError(f"Missing mandatory attribute '_FillValue' on Tanager dataset '{name}'")
+            original_fill = src_dset.attrs["_FillValue"]
             
             original_dtypes[name] = original_dtype
             original_fills[name] = original_fill
@@ -925,12 +1073,8 @@ def process_tanager_swaths_to_grid(
             out_shape = (total_num_frames, bands, master_height, master_width) if is_3d else (total_num_frames, master_height, master_width)
             chunks = (1, bands, chunk_h, chunk_w) if is_3d else (1, chunk_h, chunk_w)
 
-            if original_dtype.kind in ['f', 'c'] and original_dtype != np.float64:
-                dtype = np.dtype("int16")
-                fill_val = -9999
-            else:
-                dtype = original_dtype
-                fill_val = original_fill
+            dtype = original_dtype
+            fill_val = original_fill
 
             dset = grp_tanager.create_dataset(
                 name,
@@ -942,9 +1086,7 @@ def process_tanager_swaths_to_grid(
                 chunks=chunks
             )
             
-            if original_dtype.kind in ['f', 'c'] and original_dtype != np.float64:
-                dset.attrs["scale_factor"] = 10000
-                dset.attrs["_FillValue"] = -9999
+            dset.attrs["_FillValue"] = original_fill
 
             dim_names = ["Time", "Band", "YDim", "XDim"] if is_3d else ["Time", "YDim", "XDim"]
             datasets_created_info.append((name, dtype, len(out_shape), dim_names))
@@ -1052,10 +1194,7 @@ def process_tanager_swaths_to_grid(
         sr_valid_pixels = np.sum(valid_sr)
 
         for name in pass_canvases.keys():
-            if original_dtypes[name].kind in ['f', 'c'] and original_dtypes[name] != np.float64:
-                grp_tanager[name][t_idx, ...] = scale_to_int16(pass_canvases[name], scale_factor=10000, nodata_val=-9999)
-            else:
-                grp_tanager[name][t_idx, ...] = pass_canvases[name]
+            grp_tanager[name][t_idx, ...] = pass_canvases[name]
 
         coverage = (sr_valid_pixels / float(master_height * master_width)) * 100.0
         if coverage >= min_roi_coverage:

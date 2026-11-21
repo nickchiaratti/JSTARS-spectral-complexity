@@ -56,21 +56,61 @@ def get_inference_h5(location, config, target_metric):
     return None
 
 
-def get_default_png_name(location=LOCATION, target_metric=TARGET_METRIC):
+def get_default_png_name(location=LOCATION, target_metric=TARGET_METRIC, injected=False):
     """Generates standard diagnostic PNG filename matching interface contract."""
-    return f"{location}_CCD_{target_metric}_anomaly_overlay.png"
+    prefix = "injected_" if injected else ""
+    return f"{location}_CCD_{prefix}{target_metric}_anomaly_overlay.png"
 
 
-def plot_pixel_sits(pixel_y, pixel_x, source_h5_path, ax=None, current_date=None):
+def resolve_metric_and_group(target_metric, injected=False):
+    """Resolves (group_name, dataset_key, display_name, is_injected) from user metric argument."""
+    m_str = str(target_metric).lower().strip()
+    is_inj = injected or m_str.startswith('injected_') or 'injected' in m_str
+    base = m_str.replace('injected_', '').replace('injected', '').strip('_')
+
+    if base in ('sc', 'sliding_volume_z_score'):
+        short = 'SC'
+        ds_key = 'injected_sliding_volume_z_score' if is_inj else 'sliding_volume_z_score'
+        disp = 'Spectral Complexity (Z-Score)'
+    elif base in ('ndvi', 'ndvi_map'):
+        short = 'NDVI'
+        ds_key = 'injected_ndvi' if is_inj else 'ndvi'
+        disp = 'NDVI'
+    else:
+        short = base.upper()
+        ds_key = target_metric
+        disp = target_metric
+
+    prefix = f"INJECTED_{short}" if is_inj else short
+    group_name = f"{prefix}CCD_Results"
+    return group_name, ds_key, disp, is_inj
+
+
+def plot_pixel_sits(pixel_y, pixel_x, source_h5_path, target_metric='SC', injected=False, ax=None, current_date=None):
     """Plots pixel-level satellite image time series (SITS) with CCD model fit and confidence bounds."""
     lat, lon = None, None
-    with h5py.File(source_h5_path, 'r') as f_root:
-        f = f_root['CCD_Results']
-        target_metric = f.attrs.get('TARGET_METRIC', 'sliding_volume_z_score')
+    group_name, default_ds, target_name, is_inj = resolve_metric_and_group(target_metric, injected=injected)
 
     with h5py.File(source_h5_path, 'r') as f:
+        if group_name not in f:
+            if f"{target_metric}_CCD_Results" in f:
+                group_name = f"{target_metric}_CCD_Results"
+            elif 'CCD_Results' in f:
+                group_name = 'CCD_Results'
+            else:
+                raise KeyError(f"Group '{group_name}' not found in {source_h5_path}. Available: {list(f.keys())}")
+        ccd_grp = f[group_name]
+        actual_metric = ccd_grp.attrs.get('TARGET_METRIC', default_ds)
+
         harm_grp = f['/HDFEOS/GRIDS/HARMONIZED/Data Fields']
-        metric_ds = harm_grp[target_metric]
+        if actual_metric in harm_grp:
+            metric_ds = harm_grp[actual_metric]
+        elif default_ds in harm_grp:
+            metric_ds = harm_grp[default_ds]
+        elif default_ds == 'ndvi' and 'ndvi_map' in harm_grp:
+            metric_ds = harm_grp['ndvi_map']
+        else:
+            raise KeyError(f"Metric dataset '{actual_metric}' not found in {harm_grp.name}")
         acq_time = metric_ds.attrs.get('acquisition_time')
         if acq_time is None and 'acquisition_time' in harm_grp.attrs:
             acq_time = harm_grp.attrs['acquisition_time']
@@ -89,6 +129,9 @@ def plot_pixel_sits(pixel_y, pixel_x, source_h5_path, ax=None, current_date=None
 
         if 'source_spacecraft' in metric_ds.attrs:
             spacecraft_bytes = metric_ds.attrs['source_spacecraft'][:]
+            spacecrafts = [s.decode('utf-8') if isinstance(s, bytes) else str(s) for s in spacecraft_bytes]
+        elif 'source_spacecraft' in harm_grp['common_mask'].attrs:
+            spacecraft_bytes = harm_grp['common_mask'].attrs['source_spacecraft'][:]
             spacecrafts = [s.decode('utf-8') if isinstance(s, bytes) else str(s) for s in spacecraft_bytes]
         else:
             spacecrafts = ["Harmonized"] * len(acq_time)
@@ -112,21 +155,20 @@ def plot_pixel_sits(pixel_y, pixel_x, source_h5_path, ax=None, current_date=None
             except Exception as e:
                 print(f"Warning: Could not compute lat/lon: {e}")
 
-    dates = [datetime.fromtimestamp(ts, timezone.utc) for ts in acq_time]
-
-    with h5py.File(source_h5_path, 'r') as f_root:
-        f = f_root['CCD_Results']
-        predicted = f['predicted_series'][:, pixel_y, pixel_x]
-        rmse = f['rmse_series'][:, pixel_y, pixel_x]
-        anomalies = f['anomaly_flags'][:, pixel_y, pixel_x]
-        if 'CHANGE_PROBABILITY' in f.attrs:
-            p = f.attrs['CHANGE_PROBABILITY']
-            df = f.attrs.get('CHI2_DEGREES_OF_FREEDOM', 3)
+        predicted = ccd_grp['predicted_series'][:, pixel_y, pixel_x]
+        rmse = ccd_grp['rmse_series'][:, pixel_y, pixel_x]
+        anomalies = ccd_grp['anomaly_flags'][:, pixel_y, pixel_x]
+        if 'CHANGE_PROBABILITY' in ccd_grp.attrs:
+            p = ccd_grp.attrs['CHANGE_PROBABILITY']
+            df = ccd_grp.attrs.get('CHI2_DEGREES_OF_FREEDOM', 3)
             rmse_multiplier = np.sqrt(chi2.ppf(p, df=df))
             bound_label = f"Prediction \u00b1{rmse_multiplier:.2f}\u03c3 (p={p}, df={df})"
         else:
-            rmse_multiplier = f.attrs.get('RMSE_MULTIPLIER', 3.0)
+            rmse_multiplier = ccd_grp.attrs.get('RMSE_MULTIPLIER', 3.0)
             bound_label = f"Prediction \u00b1{rmse_multiplier}\u03c3"
+
+    dates = [datetime.fromtimestamp(ts, timezone.utc) for ts in acq_time]
+        
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(12, 6))
@@ -199,7 +241,7 @@ def plot_pixel_sits(pixel_y, pixel_x, source_h5_path, ax=None, current_date=None
     if lat is not None and lon is not None:
         title_str += f" | Lat: {lat:.5f}\u00b0, Lon: {lon:.5f}\u00b0"
     ax.set_title(title_str)
-    ax.set_ylabel(TARGET_NAME)
+    ax.set_ylabel(target_name)
     ax.grid(True, linestyle=':', alpha=0.6)
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
@@ -215,21 +257,35 @@ def plot_pixel_sits(pixel_y, pixel_x, source_h5_path, ax=None, current_date=None
         plt.show()
 
 
-def plot_spatial_anomaly_overlay(source_h5_path, output_png=None, interactive=True):
+def plot_spatial_anomaly_overlay(source_h5_path, target_metric='SC', injected=False, output_png=None, interactive=True):
     """
     Renders spatial anomaly frequency and acquisition map over satellite background.
     Supports non-interactive export to PNG without interactive GUI blocking.
     """
-    with h5py.File(source_h5_path, 'r') as f_root:
-        f = f_root['CCD_Results']
-        target_metric = f.attrs.get('TARGET_METRIC', 'sliding_volume_z_score')
-        anomaly_map = f['change_date_timestamp'][:]
-        change_count_map = f['change_count'][:]
-        min_samples = f.attrs.get('MIN_SAMPLES', 16)
-
+    group_name, default_ds, target_name, is_inj = resolve_metric_and_group(target_metric, injected=injected)
     with h5py.File(source_h5_path, 'r') as f:
+        if group_name not in f:
+            if f"{target_metric}_CCD_Results" in f:
+                group_name = f"{target_metric}_CCD_Results"
+            elif 'CCD_Results' in f:
+                group_name = 'CCD_Results'
+            else:
+                raise KeyError(f"Group '{group_name}' not found in {source_h5_path}. Available: {list(f.keys())}")
+        ccd_grp = f[group_name]
+        actual_metric = ccd_grp.attrs.get('TARGET_METRIC', default_ds)
+        anomaly_map = ccd_grp['change_date_timestamp'][:]
+        change_count_map = ccd_grp['change_count'][:]
+        min_samples = ccd_grp.attrs.get('MIN_SAMPLES', 16)
+
         harm_grp = f['/HDFEOS/GRIDS/HARMONIZED/Data Fields']
-        metric_ds = harm_grp[target_metric]
+        if actual_metric in harm_grp:
+            metric_ds = harm_grp[actual_metric]
+        elif default_ds in harm_grp:
+            metric_ds = harm_grp[default_ds]
+        elif default_ds == 'ndvi' and 'ndvi_map' in harm_grp:
+            metric_ds = harm_grp['ndvi_map']
+        else:
+            raise KeyError(f"Metric dataset '{actual_metric}' not found in {harm_grp.name}")
         acq_time = metric_ds.attrs.get('acquisition_time', harm_grp.attrs.get('acquisition_time'))[:]
         unified_masks = harm_grp['common_mask'][:]
         full_valid_mask = ~unified_masks.astype(bool)
@@ -237,8 +293,10 @@ def plot_spatial_anomaly_overlay(source_h5_path, output_png=None, interactive=Tr
     def get_ortho(idx):
         with h5py.File(source_h5_path, 'r') as f:
             harm_grp = f['/HDFEOS/GRIDS/HARMONIZED/Data Fields']
-            if 'source_spacecraft' in harm_grp[target_metric].attrs:
-                spc = harm_grp[target_metric].attrs['source_spacecraft'][idx]
+            if actual_metric in harm_grp and 'source_spacecraft' in harm_grp[actual_metric].attrs:
+                spc = harm_grp[actual_metric].attrs['source_spacecraft'][idx]
+            elif 'common_mask' in harm_grp and 'source_spacecraft' in harm_grp['common_mask'].attrs:
+                spc = harm_grp['common_mask'].attrs['source_spacecraft'][idx]
                 spc = spc.decode('utf-8') if isinstance(spc, bytes) else str(spc)
             else:
                 spc = "Harmonized"
@@ -252,7 +310,12 @@ def plot_spatial_anomaly_overlay(source_h5_path, output_png=None, interactive=Tr
                 o[~valid_mask] = 0.0
             else:
                 # Synthetic fallback for tests lacking ortho_visual
-                metric_frame = harm_grp[target_metric][idx]
+                if actual_metric in harm_grp:
+                    metric_frame = harm_grp[actual_metric][idx]
+                elif default_ds in harm_grp:
+                    metric_frame = harm_grp[default_ds][idx]
+                else:
+                    metric_frame = harm_grp['common_mask'][idx]
                 h_f, w_f = metric_frame.shape
                 o = np.zeros((h_f, w_f, 3), dtype=np.float32)
                 valid_m = ~np.isnan(metric_frame)
@@ -345,7 +408,7 @@ def plot_spatial_anomaly_overlay(source_h5_path, output_png=None, interactive=Tr
             current_date = datetime.fromtimestamp(current_date_ts, timezone.utc)
             ax_img.set_title(f"{current_sg} Acquisition: {current_date.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             ax_ts.clear()
-            plot_pixel_sits(y, x, source_h5_path, ax=ax_ts, current_date=current_date)
+            plot_pixel_sits(y, x, source_h5_path, target_metric=target_metric, injected=injected, ax=ax_ts, current_date=current_date)
             fig.canvas.draw()
 
         fig.canvas.mpl_connect('button_press_event', onclick)
@@ -376,15 +439,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Harmonized CCD Visualization")
     parser.add_argument('--source-h5', type=str, default="C:/satelliteImagery/HLST30/HLST_Rochesterv2.h5", help="Path to source harmonized HDF5")
     parser.add_argument('--output-png', type=str, default=False, help="Path to save diagnostic PNG map")
+    parser.add_argument('--metric', type=str, default=TARGET_METRIC, help="Target metric ('SC', 'NDVI')")
+    parser.add_argument('--injected', action='store_true', help="Visualize injected results ('INJECTED_SCCCD_Results', etc.)")
     parser.add_argument('--no-gui', action='store_true', help="Run in non-interactive batch mode")
     args = parser.parse_args()
 
     source_h5 = args.source_h5 
 
+    if args.metric == 'sliding_volume_z_score':
+        TARGET_NAME = 'Spectral Complexity (Z-Score)'
+        TARGET_SHORT_NAME = 'SC'
+    elif args.metric == 'ndvi':
+        TARGET_NAME = 'NDVI'
+        TARGET_SHORT_NAME = 'NDVI'
+    else:
+        TARGET_NAME = args.metric
+
     if source_h5 and os.path.exists(source_h5):
         print(f"Loading latest inference results: {source_h5}")
         plot_spatial_anomaly_overlay(
             source_h5,
+            target_metric=TARGET_SHORT_NAME,
+            injected=args.injected,
             output_png=args.output_png,
             interactive=not args.no_gui
         )

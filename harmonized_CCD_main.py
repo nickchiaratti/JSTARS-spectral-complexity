@@ -3,6 +3,11 @@ Harmonized Continuous Change Detection (CCD) Pipeline.
 """
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+import warnings
 import h5py
 import numpy as np
 import datetime
@@ -15,9 +20,6 @@ import contextlib
 from scipy.stats import chi2
 from joblib import Parallel, delayed
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", category=RuntimeWarning)
-    lasso_model.fit(X_train, Y_train)
 
 
 @contextlib.contextmanager
@@ -37,22 +39,82 @@ def tqdm_joblib(tqdm_object):
         tqdm_object.close()
 
 
-def read_scaled_int16(arr, scale_factor=10000, nodata_val=-32768):
+def get_dataset_metadata(ds):
+    """
+    Extracts fill value and scale factor from HDF5 dataset attributes without assumed defaults.
+    Fails explicitly if mandatory attributes are missing.
+    """
+    # 1. Fill value extraction
+    fill_val = None
+    if hasattr(ds, "attrs"):
+        if "_FillValue" in ds.attrs:
+            fill_val = ds.attrs["_FillValue"]
+        elif "fillvalue" in ds.attrs:
+            fill_val = ds.attrs["fillvalue"]
+        elif "fill_value" in ds.attrs:
+            fill_val = ds.attrs["fill_value"]
+
+    if fill_val is None and hasattr(ds, "fillvalue") and ds.fillvalue is not None:
+        if np.issubdtype(ds.dtype, np.floating) or ds.fillvalue != 0:
+            fill_val = ds.fillvalue
+
+    if fill_val is None and np.issubdtype(ds.dtype, np.integer):
+        raise KeyError(
+            f"Dataset '{getattr(ds, 'name', 'dataset')}' has integer datatype ({ds.dtype}) "
+            "but lacks mandatory '_FillValue' or 'fillvalue' attribute."
+        )
+
+    if fill_val is not None:
+        if np.issubdtype(ds.dtype, np.integer):
+            fill_val = int(fill_val)
+        elif np.issubdtype(ds.dtype, np.floating):
+            fill_val = float(fill_val)
+
+    # 2. Scale factor extraction
+    if np.issubdtype(ds.dtype, np.floating):
+        # Native floating-point data is unscaled unless explicitly specified
+        scale = float(ds.attrs["scale_factor"]) if (hasattr(ds, "attrs") and "scale_factor" in ds.attrs) else 1.0
+    else:
+        if hasattr(ds, "attrs") and "scale_factor" in ds.attrs:
+            scale = float(ds.attrs["scale_factor"])
+        elif hasattr(ds, "attrs") and "scale_to_float" in ds.attrs:
+            sf = float(ds.attrs["scale_to_float"])
+            scale = (1.0 / sf) if sf < 1.0 else sf
+        else:
+            raise KeyError(
+                f"Dataset '{getattr(ds, 'name', 'dataset')}' has integer datatype ({ds.dtype}) "
+                "but lacks mandatory 'scale_factor' or 'scale_to_float' attribute."
+            )
+
+    return fill_val, scale
+
+
+def read_scaled_int16(arr, scale_factor, nodata_val):
     """
     Invert int16 quantized array back to float32 reflectance.
     Preserves nodata sentinels as NaN without injecting synthetic fill values.
+    Requires explicit scale_factor and nodata_val without assumed defaults.
     """
+    if scale_factor is None:
+        raise ValueError("scale_factor must be explicitly provided without default fallback.")
+    if nodata_val is None:
+        raise ValueError("nodata_val must be explicitly provided without default fallback.")
+
     out = np.full(arr.shape, np.nan, dtype=np.float32)
     valid = (arr != nodata_val)
     out[valid] = arr[valid].astype(np.float32) / float(scale_factor)
     return out
 
 
-def scale_to_int16(arr, scale_factor=10000, nodata_val=-32768):
+def scale_to_int16(arr, scale_factor, nodata_val):
     """
     Quantize float array to int16 format.
     Preserves nodata sentinels without synthetic smoothing.
+    Requires explicit scale_factor and nodata_val without assumed defaults.
     """
+    if scale_factor is None or nodata_val is None:
+        raise ValueError("scale_factor and nodata_val must be explicitly specified without assumed defaults.")
+
     out = np.full(arr.shape, nodata_val, dtype=np.int16)
     valid = ~np.isnan(arr) & (arr != nodata_val)
     clipped = np.clip(arr[valid] * scale_factor, -32767, 32767)
@@ -65,19 +127,64 @@ def scale_to_int16(arr, scale_factor=10000, nodata_val=-32768):
 # ==========================================
 # Input/Output
 LOCATION = "Rochesterv2"
-H5_PATH = f"C:/satelliteImagery/HLST30/HLST_{LOCATION}_Harmonized_SC_EM-7_Norm-None.h5"
-TARGET_METRIC = 'sliding_volume_z_score'
+H5_PATH = f"C:/satelliteImagery/HLST30/HLST_{LOCATION}.h5"
+def resolve_metric_naming(metric_name, injected=False):
+    """Resolve display name, short prefix, and dataset key from target metric identifier."""
+    m_raw = str(metric_name).strip()
+    m_lower = m_raw.lower()
+    is_inj = injected or m_lower.startswith('injected_') or 'injected' in m_lower
+    base = m_lower.replace('injected_', '').replace('injected', '').strip('_')
 
-if TARGET_METRIC == 'sliding_volume_z_score':
-    TARGET_NAME = 'Spectral Complexity (Z-Score)'
-elif TARGET_METRIC == 'sliding_volume_robust_scale':
-    TARGET_NAME = 'Spectral Complexity (Robust)'
-elif TARGET_METRIC == 'ndvi':
-    TARGET_NAME = 'NDVI'
-elif TARGET_METRIC == 'ndbi':
-    TARGET_NAME = 'NDBI'
-else:
-    TARGET_NAME = TARGET_METRIC
+    if 'z_score' in base or base in ('sc', 'sliding_volume_z_score'):
+        disp = 'Spectral Complexity (Z-Score)'
+        short = 'SC'
+        ds_key = 'injected_sliding_volume_z_score' if is_inj else 'sliding_volume_z_score'
+    elif 'ndvi' in base:
+        disp = 'NDVI'
+        short = 'NDVI'
+        ds_key = 'injected_ndvi' if is_inj else 'ndvi'
+    elif 'robust' in base:
+        disp = 'Spectral Complexity (Robust)'
+        short = 'SC_Robust'
+        ds_key = 'injected_sliding_volume_robust_scale' if is_inj else 'sliding_volume_robust_scale'
+    elif 'ndbi' in base:
+        disp = 'NDBI'
+        short = 'NDBI'
+        ds_key = 'injected_ndbi' if is_inj else 'ndbi'
+    else:
+        clean = base.replace(' ', '_').upper()
+        disp = metric_name
+        short = clean
+        ds_key = f"injected_{m_raw}" if (is_inj and not m_lower.startswith('injected_')) else m_raw
+
+    group_prefix = f"INJECTED_{short}" if is_inj else short
+    return disp, short, ds_key, group_prefix, is_inj
+
+
+def _resolve_metric_dataset(data_grp, target_metric, metric_key, is_inj):
+    """Select the HDF5 dataset matching baseline or injected metric naming."""
+    candidates = [metric_key]
+    if is_inj:
+        if metric_key == 'injected_ndvi':
+            candidates.append('injected_ndvi_map')
+    else:
+        candidates.append(target_metric)
+        if target_metric == 'ndvi':
+            candidates.append('ndvi_map')
+
+    for key in dict.fromkeys(candidates):
+        if key in data_grp:
+            return data_grp[key]
+
+    kind = "Injected target metric" if is_inj else "Target metric"
+    raise KeyError(
+        f"{kind} '{metric_key}' not found in {data_grp.name}. "
+        f"Available datasets: {list(data_grp.keys())}"
+    )
+
+
+TARGET_METRIC = 'sliding_volume_z_score'
+TARGET_NAME, TARGET_SHORT_NAME, *_ = resolve_metric_naming(TARGET_METRIC)
 
 # Anomaly Detection Thresholds
 CHANGE_PROBABILITY = 0.99
@@ -334,33 +441,24 @@ def _process_row_chunk(chunk_args):
     return y_start, y_end, chunk_pred, chunk_rmse, chunk_coef, chunk_flags, chunk_date, chunk_count
 
 
-def resolve_h5_input(location=LOCATION, h5_path=None):
-    """Finds existing HDF5 file containing the target harmonized datasets."""
-    if h5_path and os.path.exists(h5_path):
-        return h5_path
-
-    candidates = [
-        f"C:/satelliteImagery/HLST30/HLST_{location}_Harmonized.h5",
-        f"C:/satelliteImagery/HLST30/HLST_{location}_Harmonized_SC_EM-7_Norm-None.h5",
-        rf"F:\Resilio\IMGS 890 Research\JSTARS-Spectral-Complexity\source_data\HLST_{location}_Harmonized.h5",
-        rf"F:\Resilio\IMGS 890 Research\JSTARS-Spectral-Complexity\source_data\HLST_{location}_Harmonized_SC_EM-7_Norm-None.h5",
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return H5_PATH
-
-
 def main(enable_const=ENABLE_CONSTANT,
          enable_lin=ENABLE_LINEAR,
          enable_quad=ENABLE_QUADRATIC,
          temporal_periods=None,
          target_metric=TARGET_METRIC,
+         injected=False,
+         output_group=None,
          location=LOCATION,
          h5_path=None,
          output_h5=None,
          n_jobs=None,
-         chunk_size=4):
+         chunk_size=4,
+         launch_vis=False,
+         row_start=0,
+         row_end=None,
+         col_start=0,
+         col_end=None,
+         **kwargs):
     """
     Main driver for continuous change detection regression analysis.
     """
@@ -369,8 +467,18 @@ def main(enable_const=ENABLE_CONSTANT,
 
     min_samples = MIN_SAMPLES
 
+    target_name, target_short_name, metric_key, group_prefix, is_inj = resolve_metric_naming(target_metric, injected=injected)
+    group_name = output_group if output_group is not None else f"{group_prefix}CCD_Results"
+
     if h5_path is None:
-        raise RuntimeError("No input HDF5 file provided.")
+        h5_path = H5_PATH
+        if not os.path.exists(h5_path):
+            alt_path = f"C:/satelliteImagery/HLST30/HLST_{location}v2.h5"
+            if os.path.exists(alt_path):
+                h5_path = alt_path
+
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(f"Input HDF5 file not found: {h5_path}")
 
     if output_h5 is None:
         output_h5 = h5_path
@@ -378,7 +486,8 @@ def main(enable_const=ENABLE_CONSTANT,
     print(f"Loading data from {h5_path}...")
     with h5py.File(h5_path, 'r') as f:
         data_grp = f['/HDFEOS/GRIDS/HARMONIZED/Data Fields']
-        metric_ds = data_grp[target_metric]
+        metric_ds = _resolve_metric_dataset(data_grp, target_metric, metric_key, is_inj)
+        print(f"Selected dataset '{metric_ds.name}' -> output group '{group_name}'")
 
         acq_times = metric_ds.attrs.get('acquisition_time')
         if acq_times is None and 'acquisition_time' in data_grp.attrs:
@@ -391,12 +500,34 @@ def main(enable_const=ENABLE_CONSTANT,
         if acq_times is not None:
             acq_times = np.array(acq_times[:], dtype=np.float64)
 
-        y_data = metric_ds[...]
-        if np.issubdtype(y_data.dtype, np.integer):
-            y_data = read_scaled_int16(y_data)
+        if row_end is None:
+            r_slice = slice(row_start, None)
+        else:
+            r_slice = slice(row_start, row_end)
+        if col_end is None:
+            c_slice = slice(col_start, None)
+        else:
+            c_slice = slice(col_start, col_end)
+
+        if row_start == 0 and row_end is None and col_start == 0 and col_end is None:
+            raw_y = metric_ds[...]
+            common_mask = data_grp['common_mask'][...]
+        else:
+            raw_y = metric_ds[:, r_slice, c_slice]
+            common_mask = data_grp['common_mask'][:, r_slice, c_slice]
+
+        fill_val, scale = get_dataset_metadata(metric_ds)
+
+        if np.issubdtype(raw_y.dtype, np.integer):
+            y_data = read_scaled_int16(raw_y, scale_factor=scale, nodata_val=fill_val)
+        elif np.issubdtype(raw_y.dtype, np.floating):
+            y_data = raw_y.astype(np.float32) / float(scale)
+            if fill_val is not None and not np.isnan(fill_val):
+                y_data[np.isclose(raw_y, fill_val, equal_nan=True)] = np.nan
+        else:
+            raise TypeError(f"Unsupported dataset datatype '{raw_y.dtype}' for {metric_ds.name}")
 
         # Determine valid mask
-        common_mask = data_grp['common_mask'][...]
         valid_mask = (common_mask == 0) & ~np.isnan(y_data)
 
         geo_transform = metric_ds.attrs.get('GeoTransform')
@@ -410,7 +541,10 @@ def main(enable_const=ENABLE_CONSTANT,
     num_frames, height, width = y_data.shape
 
     if acq_times is None:
-        acq_times = np.linspace(1640995200.0, 1767225600.0, num_frames, dtype=np.float64)
+        raise KeyError(
+            f"Mandatory 'acquisition_time' attribute not found for dataset '{metric_ds.name}' "
+            "or parent container. Cannot construct harmonic temporal matrix without timestamps."
+        )
 
     frac_years = extract_fractional_years(acq_times)
 
@@ -478,11 +612,11 @@ def main(enable_const=ENABLE_CONSTANT,
             change_date_map[y_start:y_end, :] = c_date
             change_count_map[y_start:y_end, :] = c_count
 
-    print(f"\nSaving Results directly to {output_h5}...")
+    print(f"\nSaving Results directly to {output_h5} -> group '{group_name}'...")
     with h5py.File(output_h5, 'a') as out_file:
-        if 'CCD_Results' in out_file:
-            del out_file['CCD_Results']
-        ccd_grp = out_file.create_group('CCD_Results')
+        if group_name in out_file:
+            del out_file[group_name]
+        ccd_grp = out_file.create_group(group_name)
 
         if spatial_ref is not None:
             ccd_grp.attrs['spatial_ref'] = spatial_ref
@@ -500,15 +634,41 @@ def main(enable_const=ENABLE_CONSTANT,
         ccd_grp.attrs['ENABLE_CONSTANT'] = enable_const
         ccd_grp.attrs['ENABLE_LINEAR'] = enable_lin
         ccd_grp.attrs['ENABLE_QUADRATIC'] = enable_quad
-        ccd_grp.attrs['TARGET_METRIC'] = target_metric
+        ccd_grp.attrs['TARGET_METRIC'] = metric_key
+        ccd_grp.attrs['TARGET_SHORT_NAME'] = target_short_name
+        ccd_grp.attrs['TARGET_NAME'] = target_name
         ccd_grp.attrs['SOURCE_DATA'] = h5_path
+        ccd_grp.attrs['acquisition_time'] = acq_times
 
-        ccd_grp.create_dataset('predicted_series', data=predicted_series, shuffle=True, compression='gzip', compression_opts=6)
-        ccd_grp.create_dataset('rmse_series', data=rmse_series, shuffle=True, compression='gzip', compression_opts=6)
-        ccd_grp.create_dataset('coef_series', data=coef_series, shuffle=True, compression='gzip', compression_opts=6)
-        ccd_grp.create_dataset('anomaly_flags', data=anomaly_flags, shuffle=True, compression='gzip', compression_opts=6)
-        ccd_grp.create_dataset('change_date_timestamp', data=change_date_map, shuffle=True, compression='gzip', compression_opts=6)
-        ccd_grp.create_dataset('change_count', data=change_count_map, shuffle=True, compression='gzip', compression_opts=6)
+        ds_pred = ccd_grp.create_dataset('predicted_series', data=predicted_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_pred.attrs['_FillValue'] = np.nan
+
+        ds_rmse = ccd_grp.create_dataset('rmse_series', data=rmse_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_rmse.attrs['_FillValue'] = np.nan
+
+        ds_coef = ccd_grp.create_dataset('coef_series', data=coef_series, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_coef.attrs['_FillValue'] = np.nan
+
+        ds_flags = ccd_grp.create_dataset('anomaly_flags', data=anomaly_flags, fillvalue=0, shuffle=True, compression='gzip', compression_opts=6)
+        ds_flags.attrs['_FillValue'] = np.uint8(0)
+
+        ds_date = ccd_grp.create_dataset('change_date_timestamp', data=change_date_map, fillvalue=np.nan, shuffle=True, compression='gzip', compression_opts=6)
+        ds_date.attrs['_FillValue'] = np.nan
+
+        ds_count = ccd_grp.create_dataset('change_count', data=change_count_map, fillvalue=0, shuffle=True, compression='gzip', compression_opts=6)
+        ds_count.attrs['_FillValue'] = np.int32(0)
+
+    if launch_vis:
+        try:
+            import harmonized_CCD_vis
+            harmonized_CCD_vis.plot_spatial_anomaly_overlay(
+                source_h5_path=output_h5,
+                target_metric=target_short_name,
+                injected=is_inj,
+                interactive=True
+            )
+        except Exception as e:
+            print(f"Warning: Failed to launch visualization: {e}")
 
     print("Harmonized CCD Pipeline Complete!")
     return output_h5
@@ -521,6 +681,7 @@ if __name__ == "__main__":
     parser.add_argument('--h5-path', type=str, default=None, help="Input source HDF5 path")
     parser.add_argument('--output-h5', type=str, default=None, help="Output CCD HDF5 path")
     parser.add_argument('--metric', type=str, default=TARGET_METRIC, help="Target metric")
+    parser.add_argument('--injected', action='store_true', help="Run CCD on injected dataset")
     parser.add_argument('--no-vis', action='store_true', help="Skip launching visualization")
     args = parser.parse_args()
 
@@ -529,5 +690,6 @@ if __name__ == "__main__":
         h5_path=args.h5_path,
         output_h5=args.output_h5,
         target_metric=args.metric,
+        injected=args.injected,
         launch_vis=not args.no_vis
     )

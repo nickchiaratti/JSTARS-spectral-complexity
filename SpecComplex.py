@@ -182,46 +182,110 @@ def process_volume_sliding_tile(frame_data, tile_size, stride, num_endmembers):
         
     return final_map
 
-def calculate_global_z_score(volume_array, valid_pixel_mask):
+def calculate_global_z_score(volume_array, valid_pixel_mask=None, array_mean=None, array_std=None):
     """
     Calculates the global Z-score for an entire frame of spectral complexity volumes.
     Decouples the evaluation space from the background statistics space by strictly 
     calculating the mean and standard deviation from radiometrically valid pixels, 
     preventing artifacts from skewing the background model.
+    Alternatively accepts a separately determined mean and standard deviation (array_mean, array_std).
+
+    Args:
+        volume_array (np.ndarray): 2D array [height, width] of spectral complexity volumes.
+        valid_pixel_mask (np.ndarray, optional): Boolean 2D mask [height, width] of radiometrically
+            valid pixels. Required if array_mean and array_std are not provided.
+        array_mean (float or np.ndarray, optional): Pre-computed mean (in log space) to use for Z-score.
+        array_std (float or np.ndarray, optional): Pre-computed standard deviation (in log space) to use for Z-score.
+
+    Returns:
+        tuple: (z_scores, global_mean, global_std)
+            - z_scores (np.ndarray): 2D array [height, width] of Z-scores.
+            - global_mean (float or np.ndarray): Mean used for normalization.
+            - global_std (float or np.ndarray): Standard deviation used for normalization.
     """
-    #print("Calculating global Z-score for frame")
     height, width = volume_array.shape
     z_scores = np.full((height, width), np.nan, dtype=np.float32)
     
     # Identify globally valid pixels (strictly positive for log transform)
     global_valid_mask = volume_array > 0.0
-    
-    # Intersect with radiometrically valid pixels for the statistical background model
-    stats_mask = global_valid_mask & valid_pixel_mask
-    
-    # Extract subset volumes strictly for statistical estimation
-    stats_vols = volume_array[stats_mask]
 
-    # Graceful fallback per user directive: Return NaNs for entire frame if no valid background exists.
-    if len(stats_vols) < 9 or len(np.unique(stats_vols)) <= 1:
-        warnings.warn("calculate_global_z_score warning: Insufficient valid pixels (< 9) or zero variance found. Returning NaNs.")
-        return z_scores, np.nan, np.nan
+    if array_mean is not None and array_std is not None:
+        if np.ndim(array_mean) == 0:
+            global_mean = float(array_mean)
+            global_std = float(array_std)
+            if np.isnan(global_mean) or np.isnan(global_std):
+                warnings.warn("calculate_global_z_score warning: NaN found in array_mean or array_std. Returning NaNs.")
+                return z_scores, np.nan, np.nan
+            if global_std <= 0:
+                raise ValueError(f"calculate_global_z_score failed: Global standard deviation must be positive, got {global_std}.")
+            mean_eval = global_mean
+            std_eval = global_std
+        else:
+            mean_arr = np.asarray(array_mean, dtype=np.float32)
+            std_arr = np.asarray(array_std, dtype=np.float32)
+            if mean_arr.size == 1:
+                global_mean = float(mean_arr.item())
+                global_std = float(std_arr.item())
+                if np.isnan(global_mean) or np.isnan(global_std):
+                    warnings.warn("calculate_global_z_score warning: NaN found in array_mean or array_std. Returning NaNs.")
+                    return z_scores, np.nan, np.nan
+                if global_std <= 0:
+                    raise ValueError(f"calculate_global_z_score failed: Global standard deviation must be positive, got {global_std}.")
+                mean_eval = global_mean
+                std_eval = global_std
+            else:
+                if mean_arr.shape != (height, width) or std_arr.shape != (height, width):
+                    raise ValueError(f"calculate_global_z_score failed: array_mean shape {mean_arr.shape} and array_std shape {std_arr.shape} must match volume_array shape ({height}, {width}).")
+                if np.any(std_arr[global_valid_mask] <= 0):
+                    raise ValueError("calculate_global_z_score failed: Global standard deviation must be positive.")
+                if np.any(np.isnan(mean_arr[global_valid_mask])) or np.any(np.isnan(std_arr[global_valid_mask])):
+                    warnings.warn("calculate_global_z_score warning: NaN found in array_mean or array_std. Returning NaNs.")
+                    return z_scores, np.nan, np.nan
+                global_mean = mean_arr
+                global_std = std_arr
+                mean_eval = mean_arr[global_valid_mask]
+                std_eval = std_arr[global_valid_mask]
+    elif (array_mean is not None) or (array_std is not None):
+        raise ValueError("calculate_global_z_score failed: Both array_mean and array_std must be provided together.")
+    else:
+        if valid_pixel_mask is None:
+            raise ValueError("calculate_global_z_score failed: valid_pixel_mask must be provided when array_mean and array_std are not specified.")
+            
+        # Intersect with radiometrically valid pixels for the statistical background model
+        stats_mask = global_valid_mask & valid_pixel_mask
         
-    log_stats_vols = np.log(stats_vols)
-    
-    # Calculate global scene statistics (using ddof=1 for unbiased sample estimator)
-    global_mean = np.mean(log_stats_vols)
-    global_std = np.std(log_stats_vols, ddof=1)
-    
-    # Strict failure handling: Prevent training on synthetically flat frames
-    if global_std == 0:
-        raise ValueError("calculate_global_z_score failed: Global standard deviation of the radiometrically valid subset is exactly zero.")
+        # Extract subset volumes strictly for statistical estimation
+        stats_vols = volume_array[stats_mask]
+
+        # Graceful fallback per user directive: Return NaNs for entire frame if no valid background exists.
+        if len(stats_vols) < 9 or len(np.unique(stats_vols)) <= 1:
+            warnings.warn("calculate_global_z_score warning: Insufficient valid pixels (< 9) or zero variance found. Returning NaNs.")
+            return z_scores, np.nan, np.nan
+            
+        log_stats_vols = np.log(stats_vols)
+        
+        # Calculate global scene statistics (using ddof=1 for unbiased sample estimator)
+        global_mean = float(np.mean(log_stats_vols))
+        global_std = float(np.std(log_stats_vols, ddof=1))
+        
+        # Strict failure handling: Prevent training on synthetically flat frames
+        if global_std == 0:
+            raise ValueError("calculate_global_z_score failed: Global standard deviation of the radiometrically valid subset is exactly zero.")
+        mean_eval = global_mean
+        std_eval = global_std
         
     # Evaluate ALL geometrically valid pixels using the pure background model
     apply_vols = volume_array[global_valid_mask]
-    log_apply_vols = np.log(apply_vols)
-    
-    # Apply standard Z-score equation
-    z_scores[global_valid_mask] = (log_apply_vols - global_mean) / global_std
+    if len(apply_vols) > 0:
+        log_apply_vols = np.log(apply_vols)
+        # Apply standard Z-score equation
+        z_scores[global_valid_mask] = (log_apply_vols - mean_eval) / std_eval
     
     return z_scores, global_mean, global_std
+    
+def scale_to_int16(arr, scale_factor, nodata_val):
+    out = np.full(arr.shape, nodata_val, dtype=np.int16)
+    valid = ~np.isnan(arr) & (arr != nodata_val)
+    scaled = np.round(arr[valid] * scale_factor)
+    out[valid] = scaled.astype(np.int16)
+    return out
