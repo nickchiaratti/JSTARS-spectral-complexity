@@ -7,7 +7,7 @@ directly into the master HDF5 container under /STRATIFIED_CHIP_BENCHMARK/.
 
 Reuses core functions and standards from:
   - SpecComplexTorch.py: Sliding window MaxD Gramian volume unmixing on GPU.
-  - harmonized_CCD_main.py: Harmonized RLS-LASSO continuous change detection engine.
+  - SC_CCM_main.py: SC-CCM detection engine.
   - pyccd_landsat_main.py: USGS LCMAP Landsat PyCCD detection engine and QA decoding.
   - USGS Splib07 multi-sensor resampled spectral library (Landsat-8, Sentinel-2, Tanager-1).
 
@@ -36,6 +36,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 import scipy.interpolate
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
 # Ensure single-threaded BLAS/OpenMP execution for workers
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -50,7 +52,7 @@ if str(script_dir) not in sys.path:
 
 # Import core modules
 import SpecComplexTorch as sc
-import SC_CCM_main as hccd
+import SC_CCM_main as scccm
 import pyccd_landsat_main as pccd
 import ccd
 
@@ -649,15 +651,19 @@ def load_all_target_spectra(splib_base=SPLIB_BASE, tanager_wavelengths=None):
     return spectra_by_material
 
 # ==============================================================================
-# STEP 2 & 3: SIMULATE SPECTRAL COMPLEXITY CUBES (GPU MAXD SLIDING VOLUME)
+# STEP 2 & 3: SIMULATE SPECTRAL COMPLEXITY CUBES (BATCHED SLIDING VOLUME)
 # ==============================================================================
 def simulate_spectral_complexity_cubes(chips, metadata, target_spectra, onset_ts):
     """
-    Computes 9x9 sliding volume Gramian complexity on GPU across all 50 conditions.
-    Evaluates baseline frames and post-onset linear mixtures using SpecComplexTorch.process_volume_sliding_tile
-    and normalizes strictly via SpecComplexTorch.calculate_global_z_score with frame_global_means and frame_global_stds.
+    Computes 9x9 sliding volume Gramian complexity across all perturbation conditions.
+    Utilizes high-throughput batched sliding-window volume unmixing via SpecComplexTorch (GPU)
+    or SpecComplex (CPU), vectorizing linear mixture simulations across all 4 patches and post-onset frames.
     """
-    print("\n[Step 2 & 3] Simulating Spectral Complexity Z-scores on GPU across 50 conditions...")
+    num_materials = len(target_spectra)
+    num_fractions = len(MIXTURE_FRACTIONS)
+    num_conditions = num_materials * num_fractions
+
+    print(f"\n[Step 2 & 3] Simulating Spectral Complexity Z-scores across {num_conditions} conditions...")
 
     harm_acq_times = metadata["harm_acq_times"]
     source_grid = metadata["harm_source_grid"]
@@ -667,9 +673,6 @@ def simulate_spectral_complexity_cubes(chips, metadata, target_spectra, onset_ts
 
     n_frames = len(harm_acq_times)
     n_patches = len(LAND_COVER_PATCHES)
-    num_materials = len(target_spectra)
-    num_fractions = len(MIXTURE_FRACTIONS)
-    num_conditions = num_materials * num_fractions
 
     # 1. Identify pre-onset and post-onset frame indices
     pre_onset_mask = harm_acq_times < onset_ts
@@ -678,61 +681,59 @@ def simulate_spectral_complexity_cubes(chips, metadata, target_spectra, onset_ts
 
     print(f"Timeline partitioning: {len(pre_onset_indices)} pre-onset frames, {len(post_onset_indices)} post-onset frames.")
 
-    # 2. Precompute unperturbed baseline Z-scores for all patches
-    print("Precomputing unperturbed baseline Z-score time series for all patches...")
-    unperturbed_z = np.full((n_patches, n_frames, PATCH_SIZE, PATCH_SIZE), np.nan, dtype=np.float32)
+    # 2. Extract or precompute unperturbed baseline Z-scores for all patches
+    if "HARMONIZED_z_score" in chips and np.count_nonzero(~np.isnan(chips["HARMONIZED_z_score"])) > 0:
+        print("Using precomputed baseline Z-score time series from master container chips...")
+        unperturbed_z = chips["HARMONIZED_z_score"].copy()
+    else:
+        print("Precomputing unperturbed baseline Z-score time series for all patches...")
+        unperturbed_z = np.full((n_patches, n_frames, PATCH_SIZE, PATCH_SIZE), np.nan, dtype=np.float32)
 
-    scale_factors = metadata["scale_factors"]
-    fill_values = metadata["fill_values"]
-    tan_gw = metadata.get("tanager_good_wavelengths")
+        scale_factors = metadata["scale_factors"]
+        fill_values = metadata["fill_values"]
+        tan_gw = metadata.get("tanager_good_wavelengths")
 
-    for t in range(n_frames):
-        mu_t = means[t]
-        std_t = stds[t]
+        for t in range(n_frames):
+            mu_t = means[t]
+            std_t = stds[t]
+            if np.isnan(mu_t) or np.isnan(std_t) or std_t <= 0:
+                continue
 
-        # Skip frames where background statistics are undefined (e.g. 100% cloud/aerosol)
-        if np.isnan(mu_t) or np.isnan(std_t) or std_t <= 0:
-            continue
+            grid_name = source_grid[t]
+            local_idx = source_idx[t]
+            if grid_name not in chips:
+                continue
 
-        grid_name = source_grid[t]
-        local_idx = source_idx[t]
+            scale = scale_factors[grid_name]
+            fill_val = fill_values[grid_name]
 
-        if grid_name not in chips:
-            continue
-
-        scale = scale_factors[grid_name]
-        fill_val = fill_values[grid_name]
-
-        for p_idx in range(n_patches):
-            raw_patch = chips[grid_name][p_idx, local_idx]
-            flt_sr = raw_patch.astype(np.float32) / float(scale)
-            if np.issubdtype(raw_patch.dtype, np.integer):
-                flt_sr[raw_patch == fill_val] = np.nan
+            raw_patches = chips[grid_name][:, local_idx]  # (n_patches, bands, H, W)
+            flt_sr = raw_patches.astype(np.float32) / float(scale)
+            if np.issubdtype(raw_patches.dtype, np.integer):
+                flt_sr[raw_patches == fill_val] = np.nan
             else:
                 if fill_val is not None and not np.isnan(fill_val):
-                    flt_sr[np.isclose(raw_patch, fill_val, equal_nan=True)] = np.nan
+                    flt_sr[np.isclose(raw_patches, fill_val, equal_nan=True)] = np.nan
 
             if grid_name == "TANAGER" and tan_gw is not None:
                 gw_mask = tan_gw[local_idx].astype(bool)
-                eval_sr = flt_sr[gw_mask, ...]
+                eval_sr = flt_sr[:, gw_mask, ...]
             else:
                 eval_sr = flt_sr
 
-            vol_map = sc.process_volume_sliding_tile(
+            vol_maps = sc.process_volume_sliding_tile_batch(
                 eval_sr, tile_size=TILE_SIZE, stride=SLIDING_STRIDE, num_endmembers=NUM_ENDMEMBERS
             )
-            valid_mask = (chips["HARMONIZED_common_mask"][p_idx, t] == 0)
-            z_map, _, _ = sc.calculate_global_z_score(
-                vol_map,
-                valid_pixel_mask=valid_mask,
+            valid_masks = (chips["HARMONIZED_common_mask"][:, t] == 0)
+            z_maps, _, _ = sc.calculate_global_z_score_batch(
+                vol_maps,
+                valid_pixel_mask=valid_masks,
                 array_mean=mu_t,
                 array_std=std_t,
             )
-            if hasattr(z_map, "detach"):
-                z_map = z_map.detach().cpu().numpy()
-            unperturbed_z[p_idx, t] = z_map
+            unperturbed_z[:, t] = z_maps
 
-    # 3. Simulate post-onset linear mixture across 50 conditions
+    # 3. Simulate post-onset linear mixture across all conditions using batched tensors
     simulated_z_cubes = np.zeros((num_conditions, n_patches, n_frames, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
 
     # Initialize all conditions with unperturbed baseline Z-scores
@@ -740,7 +741,59 @@ def simulate_spectral_complexity_cubes(chips, metadata, target_spectra, onset_ts
         for p_idx in range(n_patches):
             simulated_z_cubes[c_idx, p_idx] = unperturbed_z[p_idx].copy()
 
-    # Fast GPU simulation loop over post-onset frames
+    # Partition valid post-onset frames by sensor grid
+    scale_factors = metadata["scale_factors"]
+    fill_values = metadata["fill_values"]
+    tan_gw = metadata.get("tanager_good_wavelengths")
+
+    l8_post = [t for t in post_onset_indices if source_grid[t] == "HLSL30" and not (np.isnan(means[t]) or np.isnan(stds[t]) or stds[t] <= 0)]
+    s2_post = [t for t in post_onset_indices if source_grid[t] == "HLSS30" and not (np.isnan(means[t]) or np.isnan(stds[t]) or stds[t] <= 0)]
+    tan_post = [t for t in post_onset_indices if source_grid[t] == "TANAGER" and not (np.isnan(means[t]) or np.isnan(stds[t]) or stds[t] <= 0)]
+
+    # Pre-extract normalized base surface reflectance for post-onset frames
+    flt_l8 = None
+    if len(l8_post) > 0 and "HLSL30" in chips:
+        l8_local = [source_idx[t] for t in l8_post]
+        raw_l8 = chips["HLSL30"][:, l8_local]  # (n_patches, n_l8, 7, H, W)
+        scale_l8 = float(scale_factors["HLSL30"])
+        fill_l8 = fill_values["HLSL30"]
+        flt_l8 = raw_l8.astype(np.float32) / scale_l8
+        if np.issubdtype(raw_l8.dtype, np.integer):
+            flt_l8[raw_l8 == fill_l8] = np.nan
+        elif fill_l8 is not None and not np.isnan(fill_l8):
+            flt_l8[np.isclose(raw_l8, fill_l8, equal_nan=True)] = np.nan
+        means_l8 = means[l8_post]
+        stds_l8 = stds[l8_post]
+        mask_l8 = (chips["HARMONIZED_common_mask"][:, l8_post] == 0)
+
+    flt_s2 = None
+    if len(s2_post) > 0 and "HLSS30" in chips:
+        s2_local = [source_idx[t] for t in s2_post]
+        raw_s2 = chips["HLSS30"][:, s2_local]  # (n_patches, n_s2, 10, H, W)
+        scale_s2 = float(scale_factors["HLSS30"])
+        fill_s2 = fill_values["HLSS30"]
+        flt_s2 = raw_s2.astype(np.float32) / scale_s2
+        if np.issubdtype(raw_s2.dtype, np.integer):
+            flt_s2[raw_s2 == fill_s2] = np.nan
+        elif fill_s2 is not None and not np.isnan(fill_s2):
+            flt_s2[np.isclose(raw_s2, fill_s2, equal_nan=True)] = np.nan
+        means_s2 = means[s2_post]
+        stds_s2 = stds[s2_post]
+        mask_s2 = (chips["HARMONIZED_common_mask"][:, s2_post] == 0)
+
+    flt_tan = None
+    if len(tan_post) > 0 and "TANAGER" in chips:
+        tan_local = [source_idx[t] for t in tan_post]
+        raw_tan = chips["TANAGER"][:, tan_local]
+        scale_tan = float(scale_factors.get("TANAGER", 1.0))
+        fill_tan = fill_values.get("TANAGER")
+        flt_tan = raw_tan.astype(np.float32) / scale_tan
+        if fill_tan is not None and not np.isnan(fill_tan):
+            flt_tan[np.isclose(raw_tan, fill_tan, equal_nan=True)] = np.nan
+        means_tan = means[tan_post]
+        stds_tan = stds[tan_post]
+        mask_tan = (chips["HARMONIZED_common_mask"][:, tan_post] == 0)
+
     t_start_sim = time.perf_counter()
     cond_counter = 0
 
@@ -750,74 +803,82 @@ def simulate_spectral_complexity_cubes(chips, metadata, target_spectra, onset_ts
         spec_tanager = mat.get("spec_tanager")
 
         for f_idx, f_weight in enumerate(MIXTURE_FRACTIONS):
-            for t in post_onset_indices:
-                mu_t = means[t]
-                std_t = stds[t]
+            # 1. HLSL30 Batched simulation
+            if flt_l8 is not None and spec_l8 is not None:
+                inj_l8 = flt_l8.copy()
+                for roff, coff in INJ_OFFSETS:
+                    bg = flt_l8[:, :, :, roff, coff]
+                    inj_val = (1.0 - f_weight) * bg + f_weight * spec_l8
+                    valid_bg = ~np.isnan(bg).any(axis=-1, keepdims=True)
+                    inj_l8[:, :, :, roff, coff] = np.where(valid_bg, inj_val, bg)
 
-                if np.isnan(mu_t) or np.isnan(std_t) or std_t <= 0:
-                    continue
+                n_p, n_l8, n_b, H, W = inj_l8.shape
+                b_l8 = inj_l8.reshape(n_p * n_l8, n_b, H, W)
+                v_l8 = sc.process_volume_sliding_tile_batch(
+                    b_l8, tile_size=TILE_SIZE, stride=SLIDING_STRIDE, num_endmembers=NUM_ENDMEMBERS
+                )
+                v_l8 = v_l8.reshape(n_p, n_l8, H, W)
 
-                grid_name = source_grid[t]
-                local_idx = source_idx[t]
+                m_exp = means_l8[np.newaxis, :, np.newaxis, np.newaxis]
+                s_exp = stds_l8[np.newaxis, :, np.newaxis, np.newaxis]
+                pos = (v_l8 > 0.0)
+                val = pos & mask_l8 & (s_exp > 0) & (~np.isnan(m_exp))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    z_l8 = np.where(val, (np.log(v_l8) - m_exp) / s_exp, np.nan)
+                simulated_z_cubes[cond_counter][:, l8_post] = z_l8
 
-                if grid_name not in chips:
-                    continue
+            # 2. HLSS30 Batched simulation
+            if flt_s2 is not None and spec_s2 is not None:
+                inj_s2 = flt_s2.copy()
+                for roff, coff in INJ_OFFSETS:
+                    bg = flt_s2[:, :, :, roff, coff]
+                    inj_val = (1.0 - f_weight) * bg + f_weight * spec_s2
+                    valid_bg = ~np.isnan(bg).any(axis=-1, keepdims=True)
+                    inj_s2[:, :, :, roff, coff] = np.where(valid_bg, inj_val, bg)
 
-                scale = scale_factors[grid_name]
-                fill_val = fill_values[grid_name]
+                n_p, n_s2, n_b, H, W = inj_s2.shape
+                b_s2 = inj_s2.reshape(n_p * n_s2, n_b, H, W)
+                v_s2 = sc.process_volume_sliding_tile_batch(
+                    b_s2, tile_size=TILE_SIZE, stride=SLIDING_STRIDE, num_endmembers=NUM_ENDMEMBERS
+                )
+                v_s2 = v_s2.reshape(n_p, n_s2, H, W)
 
-                if grid_name == "HLSL30":
-                    target_spec = spec_l8
-                elif grid_name == "HLSS30":
-                    target_spec = spec_s2
-                elif grid_name == "TANAGER":
-                    target_spec = spec_tanager
-                else:
-                    continue
+                m_exp = means_s2[np.newaxis, :, np.newaxis, np.newaxis]
+                s_exp = stds_s2[np.newaxis, :, np.newaxis, np.newaxis]
+                pos = (v_s2 > 0.0)
+                val = pos & mask_s2 & (s_exp > 0) & (~np.isnan(m_exp))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    z_s2 = np.where(val, (np.log(v_s2) - m_exp) / s_exp, np.nan)
+                simulated_z_cubes[cond_counter][:, s2_post] = z_s2
 
-                if target_spec is None:
-                    continue
+            # 3. TANAGER Batched simulation
+            if flt_tan is not None and spec_tanager is not None:
+                inj_tan = flt_tan.copy()
+                for roff, coff in INJ_OFFSETS:
+                    bg = flt_tan[:, :, :, roff, coff]
+                    inj_val = (1.0 - f_weight) * bg + f_weight * spec_tanager
+                    valid_bg = ~np.isnan(bg).any(axis=-1, keepdims=True)
+                    inj_tan[:, :, :, roff, coff] = np.where(valid_bg, inj_val, bg)
 
-                for p_idx in range(n_patches):
-                    raw_patch = chips[grid_name][p_idx, local_idx]
-                    flt_sr = raw_patch.astype(np.float32) / float(scale)
-                    if np.issubdtype(raw_patch.dtype, np.integer):
-                        flt_sr[raw_patch == fill_val] = np.nan
-                    else:
-                        if fill_val is not None and not np.isnan(fill_val):
-                            flt_sr[np.isclose(raw_patch, fill_val, equal_nan=True)] = np.nan
+                n_p, n_tan, n_b, H, W = inj_tan.shape
+                b_tan = inj_tan.reshape(n_p * n_tan, n_b, H, W)
+                v_tan = sc.process_volume_sliding_tile_batch(
+                    b_tan, tile_size=TILE_SIZE, stride=SLIDING_STRIDE, num_endmembers=NUM_ENDMEMBERS
+                )
+                v_tan = v_tan.reshape(n_p, n_tan, H, W)
 
-                    # Inject linear mixture into the 4 designated pixels
-                    injected_sr = flt_sr.copy()
-                    for roff, coff in INJ_OFFSETS:
-                        bg_pixel = flt_sr[:, roff, coff]
-                        if not np.isnan(bg_pixel).any():
-                            injected_sr[:, roff, coff] = (1.0 - f_weight) * bg_pixel + f_weight * target_spec
-
-                    if grid_name == "TANAGER" and tan_gw is not None:
-                        gw_mask = tan_gw[local_idx].astype(bool)
-                        eval_injected = injected_sr[gw_mask, ...]
-                    else:
-                        eval_injected = injected_sr
-
-                    vol_map = sc.process_volume_sliding_tile(
-                        eval_injected, tile_size=TILE_SIZE, stride=SLIDING_STRIDE, num_endmembers=NUM_ENDMEMBERS
-                    )
-                    valid_mask = (chips["HARMONIZED_common_mask"][p_idx, t] == 0)
-                    z_map, _, _ = sc.calculate_global_z_score(
-                        vol_map,
-                        valid_pixel_mask=valid_mask,
-                        array_mean=mu_t,
-                        array_std=std_t,
-                    )
-                    if hasattr(z_map, "detach"):
-                        z_map = z_map.detach().cpu().numpy()
-                    simulated_z_cubes[cond_counter, p_idx, t] = z_map
+                m_exp = means_tan[np.newaxis, :, np.newaxis, np.newaxis]
+                s_exp = stds_tan[np.newaxis, :, np.newaxis, np.newaxis]
+                pos = (v_tan > 0.0)
+                val = pos & mask_tan & (s_exp > 0) & (~np.isnan(m_exp))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    z_tan = np.where(val, (np.log(v_tan) - m_exp) / s_exp, np.nan)
+                simulated_z_cubes[cond_counter][:, tan_post] = z_tan
 
             cond_counter += 1
 
     t_elapsed_sim = time.perf_counter() - t_start_sim
-    print(f"Completed GPU simulation of 50 conditions in {t_elapsed_sim:.2f} s ({t_elapsed_sim/num_conditions:.2f} s/condition).")
+    print(f"Completed simulation of {num_conditions} conditions in {t_elapsed_sim:.2f} s ({t_elapsed_sim/num_conditions:.3f} s/condition).")
 
     return simulated_z_cubes, unperturbed_z
 
@@ -844,8 +905,8 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
             f"Please run harmonized_CCD_main.py first before executing the stratified patch benchmark."
         )
     harm_acq_times = metadata["harm_acq_times"]
-    frac_years = hccd.extract_fractional_years(harm_acq_times)
-    X_full = hccd.build_harmonic_matrix(frac_years)
+    frac_years = scccm.extract_fractional_years(harm_acq_times)
+    X_full = scccm.build_harmonic_matrix(frac_years)
 
     common_mask = chips["HARMONIZED_common_mask"]
     valid_mask_all = (common_mask == 0)
@@ -861,7 +922,9 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
     scccd_change_counts = np.zeros((num_conditions, n_patches, PATCH_SIZE, PATCH_SIZE), dtype=np.int32)
     scccd_segment_list = []
 
-    rec_idx = 0
+    # Prepare chunks for parallel execution
+    chunk_list = []
+    chunk_meta = []
     cond_idx = 0
 
     for m_idx, mat in enumerate(target_spectra):
@@ -886,173 +949,182 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
                     0, 9, 9,
                     y_inner, valid_inner,
                     frac_years, X_full, harm_acq_times,
-                    hccd.MIN_SAMPLES, hccd.CHANGE_PROBABILITY, hccd.CONSECUTIVE_ANOMALIES
+                    scccm.MIN_SAMPLES, scccm.CHANGE_PROBABILITY, scccm.CONSECUTIVE_ANOMALIES
                 )
-
-                res = hccd._process_row_chunk(chunk_args)
-                chunk_pred = res[2]
-                chunk_date = res[6]
-                chunk_count = res[7]
-                chunk_segments = res[8] if len(res) > 8 else {}
-
-                # Record spatial results for inner 9x9 evaluated region; store post-onset break date if present
-                for r_in in range(9):
-                    for c_in in range(9):
-                        p_segs = chunk_segments.get((r_in, c_in), [])
-                        p_cnt = len([s for s in p_segs if s.get("has_break", False)])
-                        scccd_change_counts[cond_idx, p_idx, 2 + r_in, 2 + c_in] = p_cnt
-
-                        eff_ts_p = np.nan
-                        for s in p_segs:
-                            if s.get("has_break", False):
-                                b_ts_cand = s.get("break_date", np.nan)
-                                c_ts_cand = s.get("confirm_date", np.nan)
-                                if b_ts_cand >= onset_ts:
-                                    eff_ts_p = b_ts_cand
-                                    break
-                                elif c_ts_cand >= onset_ts:
-                                    run_idx = [k for k in range(s["break_idx"], s["confirm_idx"] + 1)
-                                               if valid_inner[k, r_in, c_in] and harm_acq_times[k] >= onset_ts]
-                                    eff_ts_p = float(harm_acq_times[run_idx[0]]) if run_idx else c_ts_cand
-                                    break
-                        scccd_change_dates[cond_idx, p_idx, 2 + r_in, 2 + c_in] = eff_ts_p
-
-                for p_num, (roff, coff) in enumerate(INJ_OFFSETS, 1):
-                    scene_r = r0 + roff
-                    scene_c = c0 + coff
-
-                    inner_r = roff - 2
-                    inner_c = coff - 2
-                    b_count = int(chunk_count[inner_r, inner_c])
-                    pixel_segs = chunk_segments.get((inner_r, inner_c), [])
-
-                    # Parse all segments and identify post-onset breaks
-                    post_onset_breaks = []
-                    for s in pixel_segs:
-                        has_b = s.get("has_break", False)
-                        b_ts = s.get("break_date", np.nan)
-                        c_ts = s.get("confirm_date", np.nan)
-                        is_post = False
-                        eff_b_ts = np.nan
-
-                        if has_b:
-                            if b_ts >= onset_ts:
-                                is_post = True
-                                eff_b_ts = b_ts
-                            elif c_ts >= onset_ts:
-                                run_idx = [k for k in range(s["break_idx"], s["confirm_idx"] + 1)
-                                           if valid_inner[k, inner_r, inner_c] and harm_acq_times[k] >= onset_ts]
-                                eff_b_ts = float(harm_acq_times[run_idx[0]]) if run_idx else c_ts
-                                is_post = True
-
-                            if is_post:
-                                post_onset_breaks.append({
-                                    "segment": s,
-                                    "break_timestamp": eff_b_ts,
-                                    "confirmation_timestamp": c_ts,
-                                    "raw_break_timestamp": b_ts,
-                                })
-
-                        # Segment residual magnitude
-                        s_start = s["start_idx"]
-                        s_end = s["end_idx"]
-                        v_seg = np.where(valid_inner[s_start:s_end+1, inner_r, inner_c])[0] + s_start
-                        if len(v_seg) > 0:
-                            act_s = y_inner[v_seg, inner_r, inner_c]
-                            pred_s = chunk_pred[v_seg, inner_r, inner_c]
-                            mag_seg = float(np.nanmean(np.abs(act_s - pred_s)))
-                        else:
-                            mag_seg = 0.0
-
-                        seg_rec = np.zeros(1, dtype=SEGMENT_RECORD_DTYPE)[0]
-                        seg_rec["condition_idx"] = cond_idx
-                        seg_rec["material_id"] = m_id
-                        seg_rec["material_name"] = m_name
-                        seg_rec["mixture_fraction"] = f_weight
-                        seg_rec["patch_id"] = p_id
-                        seg_rec["patch_name"] = p_name
-                        seg_rec["pixel_num"] = p_num
-                        seg_rec["scene_row"] = scene_r
-                        seg_rec["scene_col"] = scene_c
-                        seg_rec["segment_num"] = s["segment_idx"]
-                        seg_rec["start_timestamp"] = s["start_date"]
-                        seg_rec["end_timestamp"] = s["end_date"]
-                        seg_rec["has_break"] = has_b
-                        seg_rec["break_num"] = s.get("break_num", 0)
-                        seg_rec["break_timestamp"] = eff_b_ts if is_post else b_ts
-                        seg_rec["confirmation_timestamp"] = c_ts
-                        seg_rec["is_post_onset"] = is_post
-                        seg_rec["latency_days"] = float((eff_b_ts - onset_ts) / 86400.0) if is_post else np.nan
-                        seg_rec["confirmation_latency_days"] = float((c_ts - onset_ts) / 86400.0) if is_post else np.nan
-                        seg_rec["break_magnitude"] = mag_seg
-                        seg_rec["rmse"] = float(s["rmse"])
-                        seg_rec["num_observations"] = int(s["n_points"])
-                        scccd_segment_list.append(seg_rec)
-
-                    # Compare against baseline SC-CCD evaluation (produced by harmonized_CCD_main.py)
-                    base_count = int(baseline_scccd["count"][p_idx, roff, coff])
-                    base_date = float(baseline_scccd["date"][p_idx, roff, coff])
-
-                    n_post = len(post_onset_breaks)
-                    has_mult = (n_post > 1)
-
-                    # Detection criteria: break occurred on or after onset date that was not already present in baseline
-                    if n_post > 0:
-                        primary_brk = post_onset_breaks[0]
-                        pri_b_ts = primary_brk["break_timestamp"]
-                        pri_c_ts = primary_brk["confirmation_timestamp"]
-                        is_new_break = (
-                            (base_count == 0) or
-                            np.isnan(base_date) or
-                            (b_count > base_count) or
-                            (pri_b_ts < base_date)
-                        )
-                        detected = is_new_break
-                        latency = float((pri_b_ts - onset_ts) / 86400.0) if detected else np.nan
-                        confirm_lat = float((pri_c_ts - onset_ts) / 86400.0) if detected else np.nan
-                    else:
-                        pri_b_ts = np.nan
-                        pri_c_ts = np.nan
-                        detected = False
-                        latency = np.nan
-                        confirm_lat = np.nan
-
-                    # Break magnitude: residual jump post-onset
-                    if detected:
-                        post_valid = np.where(valid_inner[:, inner_r, inner_c] & (harm_acq_times >= onset_ts))[0]
-                        if len(post_valid) > 0:
-                            actuals = y_inner[post_valid, inner_r, inner_c]
-                            preds = chunk_pred[post_valid, inner_r, inner_c]
-                            mag = float(np.nanmean(np.abs(actuals - preds)))
-                        else:
-                            mag = 0.0
-                    else:
-                        mag = 0.0
-
-                    rec = results_table[rec_idx]
-                    rec["condition_idx"] = cond_idx
-                    rec["material_id"] = m_id
-                    rec["material_name"] = m_name
-                    rec["mixture_fraction"] = f_weight
-                    rec["patch_id"] = p_id
-                    rec["patch_name"] = p_name
-                    rec["pixel_num"] = p_num
-                    rec["scene_row"] = scene_r
-                    rec["scene_col"] = scene_c
-                    rec["break_detected"] = detected
-                    rec["break_timestamp"] = pri_b_ts if detected else np.nan
-                    rec["latency_days"] = latency
-                    rec["break_magnitude"] = mag
-                    rec["p_value"] = 0.99 if detected else 0.0
-                    rec["total_breaks"] = b_count
-                    rec["post_onset_breaks"] = n_post
-                    rec["has_multiple_post_breaks"] = has_mult
-                    rec["confirmation_timestamp"] = pri_c_ts if detected else np.nan
-                    rec["confirmation_latency_days"] = confirm_lat
-
-                    rec_idx += 1
+                chunk_list.append(chunk_args)
+                chunk_meta.append((cond_idx, p_idx, m_id, m_name, f_weight, p_id, p_name, r0, c0, y_inner, valid_inner))
 
             cond_idx += 1
+
+    print(f"Parallel dispatching {len(chunk_list)} SC-CCD 9x9 chunks across all CPU cores...")
+    results_gen = Parallel(n_jobs=-1, return_as='generator')(
+        delayed(scccm._process_row_chunk)(args) for args in chunk_list
+    )
+
+    rec_idx = 0
+    for meta, res in zip(chunk_meta, tqdm(results_gen, total=len(chunk_list), desc="SC-CCD chunks")):
+        (cond_idx, p_idx, m_id, m_name, f_weight, p_id, p_name, r0, c0, y_inner, valid_inner) = meta
+        chunk_pred = res[2]
+        chunk_date = res[6]
+        chunk_count = res[7]
+        chunk_segments = res[8] if len(res) > 8 else {}
+
+        # Record spatial results for inner 9x9 evaluated region; store post-onset break date if present
+        for r_in in range(9):
+            for c_in in range(9):
+                p_segs = chunk_segments.get((r_in, c_in), [])
+                p_cnt = len([s for s in p_segs if s.get("has_break", False)])
+                scccd_change_counts[cond_idx, p_idx, 2 + r_in, 2 + c_in] = p_cnt
+
+                eff_ts_p = np.nan
+                for s in p_segs:
+                    if s.get("has_break", False):
+                        b_ts_cand = s.get("break_date", np.nan)
+                        c_ts_cand = s.get("confirm_date", np.nan)
+                        if b_ts_cand >= onset_ts:
+                            eff_ts_p = b_ts_cand
+                            break
+                        elif c_ts_cand >= onset_ts:
+                            run_idx = [k for k in range(s["break_idx"], s["confirm_idx"] + 1)
+                                       if valid_inner[k, r_in, c_in] and harm_acq_times[k] >= onset_ts]
+                            eff_ts_p = float(harm_acq_times[run_idx[0]]) if run_idx else c_ts_cand
+                            break
+                scccd_change_dates[cond_idx, p_idx, 2 + r_in, 2 + c_in] = eff_ts_p
+
+        for p_num, (roff, coff) in enumerate(INJ_OFFSETS, 1):
+            scene_r = r0 + roff
+            scene_c = c0 + coff
+
+            inner_r = roff - 2
+            inner_c = coff - 2
+            b_count = int(chunk_count[inner_r, inner_c])
+            pixel_segs = chunk_segments.get((inner_r, inner_c), [])
+
+            # Parse all segments and identify post-onset breaks
+            post_onset_breaks = []
+            for s in pixel_segs:
+                has_b = s.get("has_break", False)
+                b_ts = s.get("break_date", np.nan)
+                c_ts = s.get("confirm_date", np.nan)
+                is_post = False
+                eff_b_ts = np.nan
+
+                if has_b:
+                    if b_ts >= onset_ts:
+                        is_post = True
+                        eff_b_ts = b_ts
+                    elif c_ts >= onset_ts:
+                        run_idx = [k for k in range(s["break_idx"], s["confirm_idx"] + 1)
+                                   if valid_inner[k, inner_r, inner_c] and harm_acq_times[k] >= onset_ts]
+                        eff_b_ts = float(harm_acq_times[run_idx[0]]) if run_idx else c_ts
+                        is_post = True
+
+                    if is_post:
+                        post_onset_breaks.append({
+                            "segment": s,
+                            "break_timestamp": eff_b_ts,
+                            "confirmation_timestamp": c_ts,
+                            "raw_break_timestamp": b_ts,
+                        })
+
+                # Segment residual magnitude
+                s_start = s["start_idx"]
+                s_end = s["end_idx"]
+                v_seg = np.where(valid_inner[s_start:s_end+1, inner_r, inner_c])[0] + s_start
+                if len(v_seg) > 0:
+                    act_s = y_inner[v_seg, inner_r, inner_c]
+                    pred_s = chunk_pred[v_seg, inner_r, inner_c]
+                    mag_seg = float(np.nanmean(np.abs(act_s - pred_s)))
+                else:
+                    mag_seg = 0.0
+
+                seg_rec = np.zeros(1, dtype=SEGMENT_RECORD_DTYPE)[0]
+                seg_rec["condition_idx"] = cond_idx
+                seg_rec["material_id"] = m_id
+                seg_rec["material_name"] = m_name
+                seg_rec["mixture_fraction"] = f_weight
+                seg_rec["patch_id"] = p_id
+                seg_rec["patch_name"] = p_name
+                seg_rec["pixel_num"] = p_num
+                seg_rec["scene_row"] = scene_r
+                seg_rec["scene_col"] = scene_c
+                seg_rec["segment_num"] = s["segment_idx"]
+                seg_rec["start_timestamp"] = s["start_date"]
+                seg_rec["end_timestamp"] = s["end_date"]
+                seg_rec["has_break"] = has_b
+                seg_rec["break_num"] = s.get("break_num", 0)
+                seg_rec["break_timestamp"] = eff_b_ts if is_post else b_ts
+                seg_rec["confirmation_timestamp"] = c_ts
+                seg_rec["is_post_onset"] = is_post
+                seg_rec["latency_days"] = float((eff_b_ts - onset_ts) / 86400.0) if is_post else np.nan
+                seg_rec["confirmation_latency_days"] = float((c_ts - onset_ts) / 86400.0) if is_post else np.nan
+                seg_rec["break_magnitude"] = mag_seg
+                seg_rec["rmse"] = float(s["rmse"])
+                seg_rec["num_observations"] = int(s["n_points"])
+                scccd_segment_list.append(seg_rec)
+
+            # Compare against baseline SC-CCD evaluation (produced by harmonized_CCD_main.py)
+            base_count = int(baseline_scccd["count"][p_idx, roff, coff])
+            base_date = float(baseline_scccd["date"][p_idx, roff, coff])
+
+            n_post = len(post_onset_breaks)
+            has_mult = (n_post > 1)
+
+            # Detection criteria: break occurred on or after onset date that was not already present in baseline
+            if n_post > 0:
+                primary_brk = post_onset_breaks[0]
+                pri_b_ts = primary_brk["break_timestamp"]
+                pri_c_ts = primary_brk["confirmation_timestamp"]
+                is_new_break = (
+                    (base_count == 0) or
+                    np.isnan(base_date) or
+                    (b_count > base_count) or
+                    (pri_b_ts < base_date)
+                )
+                detected = is_new_break
+                latency = float((pri_b_ts - onset_ts) / 86400.0) if detected else np.nan
+                confirm_lat = float((pri_c_ts - onset_ts) / 86400.0) if detected else np.nan
+            else:
+                pri_b_ts = np.nan
+                pri_c_ts = np.nan
+                detected = False
+                latency = np.nan
+                confirm_lat = np.nan
+
+            # Break magnitude: residual jump post-onset
+            if detected:
+                post_valid = np.where(valid_inner[:, inner_r, inner_c] & (harm_acq_times >= onset_ts))[0]
+                if len(post_valid) > 0:
+                    actuals = y_inner[post_valid, inner_r, inner_c]
+                    preds = chunk_pred[post_valid, inner_r, inner_c]
+                    mag = float(np.nanmean(np.abs(actuals - preds)))
+                else:
+                    mag = 0.0
+            else:
+                mag = 0.0
+
+            rec = results_table[rec_idx]
+            rec["condition_idx"] = cond_idx
+            rec["material_id"] = m_id
+            rec["material_name"] = m_name
+            rec["mixture_fraction"] = f_weight
+            rec["patch_id"] = p_id
+            rec["patch_name"] = p_name
+            rec["pixel_num"] = p_num
+            rec["scene_row"] = scene_r
+            rec["scene_col"] = scene_c
+            rec["break_detected"] = detected
+            rec["break_timestamp"] = pri_b_ts if detected else np.nan
+            rec["latency_days"] = latency
+            rec["break_magnitude"] = mag
+            rec["p_value"] = 0.99 if detected else 0.0
+            rec["total_breaks"] = b_count
+            rec["post_onset_breaks"] = n_post
+            rec["has_multiple_post_breaks"] = has_mult
+            rec["confirmation_timestamp"] = pri_c_ts if detected else np.nan
+            rec["confirmation_latency_days"] = confirm_lat
+
+            rec_idx += 1
 
     detected_count = np.sum(results_table["break_detected"])
     multiple_break_count = np.sum(results_table["has_multiple_post_breaks"])
@@ -1073,6 +1145,27 @@ def run_scccd_benchmark(sim_z_cubes, chips, metadata, target_spectra, onset_ts, 
 # ==============================================================================
 # STEP 5: RUN LANDSAT PYCCD BREAK DETECTION
 # ==============================================================================
+def _eval_pyccd_pixel(ordinal_dates, blues, greens, reds, nirs, swir1s, swir2s, nominal_thermals, qas_pixel, proc_params):
+    """
+    Worker function to execute PyCCD detection on a single pixel time series in a parallel subprocess.
+    """
+    pccd.patch_pyccd()
+    usable_count = int(np.count_nonzero((qas_pixel == 1) | (qas_pixel == 2) | (qas_pixel == 4)))
+    if usable_count < pccd.MIN_CLEAR_SAMPLES:
+        return []
+    try:
+        res = ccd.detect(
+            ordinal_dates,
+            blues, greens, reds, nirs, swir1s, swir2s,
+            nominal_thermals,
+            qas_pixel,
+            params=proc_params
+        )
+        return res.get("change_models", [])
+    except Exception:
+        return []
+
+
 def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pyccd=None, return_spatial=True):
     """
     Executes USGS LCMAP Landsat PyCCD break detection across all 800 test instances.
@@ -1111,8 +1204,10 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
     pyccd_change_counts = np.zeros((num_conditions, n_patches, PATCH_SIZE, PATCH_SIZE), dtype=np.int32)
     pyccd_segment_list = []
 
-    rec_idx = 0
-    cond_idx = 0
+    # Initialize all condition spatial grids with baseline PyCCD results
+    for p_idx in range(n_patches):
+        pyccd_change_dates[:, p_idx] = baseline_pyccd["date"][p_idx]
+        pyccd_change_counts[:, p_idx] = baseline_pyccd["count"][p_idx]
 
     proc_params = {
         "QA_BITPACKED": False,
@@ -1131,6 +1226,11 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
     l30_scale = metadata["scale_factors"]["HLSL30"]
     l30_fill = metadata["fill_values"]["HLSL30"]
 
+    # Pre-build injected pixel time series for all evaluations
+    pyccd_tasks = []
+    pyccd_meta = []
+    cond_idx = 0
+
     for m_idx, mat in enumerate(target_spectra):
         m_id = mat["id"].encode("utf-8")
         m_name = mat["name"].encode("utf-8")
@@ -1141,10 +1241,6 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
                 p_id = p["id"].encode("utf-8")
                 p_name = p["name"].encode("utf-8")
                 r0, c0 = p["r0"], p["c0"]
-
-                # Copy baseline PyCCD evaluation for neighboring baseline pixels to maintain output array size
-                pyccd_change_dates[cond_idx, p_idx] = baseline_pyccd["date"][p_idx].copy()
-                pyccd_change_counts[cond_idx, p_idx] = baseline_pyccd["count"][p_idx].copy()
 
                 l30_patch = chips["HLSL30"][p_idx]          # shape: (n_frames, 7, PATCH_SIZE, PATCH_SIZE)
                 fmask_patch = chips["HLSL30_Fmask"][p_idx]  # shape: (n_frames, PATCH_SIZE, PATCH_SIZE)
@@ -1179,138 +1275,132 @@ def run_pyccd_benchmark(chips, metadata, target_spectra, onset_ts, baseline_pycc
                     sr_pixel_bands = np.column_stack([blues, greens, reds, nirs, swir1s, swir2s])
                     qas_pixel = pccd.decode_categorical_qa(fm_pixel, cm_pixel, sr_pixel_bands, fill_val=l30_fill)
 
-                    usable_count = int(np.count_nonzero((qas_pixel == 1) | (qas_pixel == 2) | (qas_pixel == 4)))
-
-                    detected = False
-                    break_ts = np.nan
-                    latency = np.nan
-                    mag = 0.0
-                    b_count = 0
-                    post_onset_breaks = []
-
-                    if usable_count >= pccd.MIN_CLEAR_SAMPLES:
-                        try:
-                            res = ccd.detect(
-                                ordinal_dates,
-                                blues, greens, reds, nirs, swir1s, swir2s,
-                                nominal_thermals,
-                                qas_pixel,
-                                params=proc_params
-                            )
-                            models = res.get("change_models", [])
-                            breaks = [m for m in models if m.get("change_probability", 0) > 0]
-                            b_count = len(breaks)
-
-                            for m_idx_seg, m in enumerate(models, 1):
-                                s_day = m.get("start_day")
-                                e_day = m.get("end_day")
-                                b_day = m.get("break_day")
-                                has_b = (b_day is not None and b_day > 0 and m.get("change_probability", 0) > 0)
-
-                                s_dt = datetime.date.fromordinal(s_day)
-                                s_ts = datetime.datetime(s_dt.year, s_dt.month, s_dt.day, tzinfo=datetime.timezone.utc).timestamp()
-                                e_dt = datetime.date.fromordinal(e_day)
-                                e_ts = datetime.datetime(e_dt.year, e_dt.month, e_dt.day, tzinfo=datetime.timezone.utc).timestamp()
-
-                                if has_b:
-                                    b_dt = datetime.date.fromordinal(b_day)
-                                    b_time = datetime.datetime(b_dt.year, b_dt.month, b_dt.day, tzinfo=datetime.timezone.utc).timestamp()
-                                    is_post = (b_day >= onset_ordinal)
-                                    lat_seg = float((b_time - onset_ts) / 86400.0) if is_post else np.nan
-                                    mags = m.get("magnitudes", [0.0])
-                                    mag_seg = float(np.linalg.norm(mags))
-                                    if is_post:
-                                        post_onset_breaks.append((b_time, lat_seg, mag_seg))
-                                else:
-                                    b_time = np.nan
-                                    is_post = False
-                                    lat_seg = np.nan
-                                    mag_seg = 0.0
-
-                                seg_rec = np.zeros(1, dtype=SEGMENT_RECORD_DTYPE)[0]
-                                seg_rec["condition_idx"] = cond_idx
-                                seg_rec["material_id"] = m_id
-                                seg_rec["material_name"] = m_name
-                                seg_rec["mixture_fraction"] = f_weight
-                                seg_rec["patch_id"] = p_id
-                                seg_rec["patch_name"] = p_name
-                                seg_rec["pixel_num"] = p_num
-                                seg_rec["scene_row"] = scene_r
-                                seg_rec["scene_col"] = scene_c
-                                seg_rec["segment_num"] = m_idx_seg
-                                seg_rec["start_timestamp"] = s_ts
-                                seg_rec["end_timestamp"] = e_ts
-                                seg_rec["has_break"] = has_b
-                                seg_rec["break_num"] = m_idx_seg if has_b else 0
-                                seg_rec["break_timestamp"] = b_time
-                                seg_rec["confirmation_timestamp"] = b_time
-                                seg_rec["is_post_onset"] = is_post
-                                seg_rec["latency_days"] = lat_seg
-                                seg_rec["confirmation_latency_days"] = lat_seg
-                                seg_rec["break_magnitude"] = mag_seg
-                                rmse_val = m.get("rmse", [0.0])
-                                seg_rec["rmse"] = float(np.mean(rmse_val)) if hasattr(rmse_val, '__len__') else float(rmse_val)
-                                seg_rec["num_observations"] = int(m.get("observation_count", 0))
-                                pyccd_segment_list.append(seg_rec)
-
-                        except Exception:
-                            detected = False
-                            b_count = 0
-
-                    # Compare against baseline PyCCD evaluation (produced by pyccd_landsat_main.py)
-                    base_count = int(baseline_pyccd["count"][p_idx, roff, coff])
-                    base_date = float(baseline_pyccd["date"][p_idx, roff, coff])
-
-                    n_post = len(post_onset_breaks)
-                    has_mult = (n_post > 1)
-
-                    if n_post > 0:
-                        pri_b_ts, pri_lat, pri_mag = post_onset_breaks[0]
-                        has_break_post_onset = (not np.isnan(pri_b_ts)) and (pri_b_ts >= onset_ts)
-                        is_new_break = has_break_post_onset and (
-                            (base_count == 0) or
-                            np.isnan(base_date) or
-                            (b_count > base_count) or
-                            (pri_b_ts < base_date)
-                        )
-                        detected = is_new_break
-                        break_ts = pri_b_ts if detected else np.nan
-                        latency = pri_lat if detected else np.nan
-                        mag = pri_mag if detected else 0.0
-                    else:
-                        detected = False
-                        break_ts = np.nan
-                        latency = np.nan
-                        mag = 0.0
-
-                    # Update the patch spatial arrays for the implanted pixel
-                    pyccd_change_dates[cond_idx, p_idx, roff, coff] = break_ts if detected else np.nan
-                    pyccd_change_counts[cond_idx, p_idx, roff, coff] = b_count
-
-                    rec = results_table[rec_idx]
-                    rec["condition_idx"] = cond_idx
-                    rec["material_id"] = m_id
-                    rec["material_name"] = m_name
-                    rec["mixture_fraction"] = f_weight
-                    rec["patch_id"] = p_id
-                    rec["patch_name"] = p_name
-                    rec["pixel_num"] = p_num
-                    rec["scene_row"] = scene_r
-                    rec["scene_col"] = scene_c
-                    rec["break_detected"] = detected
-                    rec["break_timestamp"] = break_ts
-                    rec["latency_days"] = latency
-                    rec["break_magnitude"] = mag
-                    rec["p_value"] = 1.0 if detected else 0.0
-                    rec["total_breaks"] = b_count
-                    rec["post_onset_breaks"] = n_post
-                    rec["has_multiple_post_breaks"] = has_mult
-                    rec["confirmation_timestamp"] = break_ts
-                    rec["confirmation_latency_days"] = latency
-
-                    rec_idx += 1
+                    task_args = (
+                        ordinal_dates, blues, greens, reds, nirs, swir1s, swir2s,
+                        nominal_thermals, qas_pixel, proc_params
+                    )
+                    pyccd_tasks.append(task_args)
+                    pyccd_meta.append((cond_idx, p_idx, m_id, m_name, f_weight, p_id, p_name, p_num, roff, coff, scene_r, scene_c))
 
             cond_idx += 1
+
+    print(f"Parallel dispatching {len(pyccd_tasks)} PyCCD pixel evaluations across all CPU cores (batch_size=64)...")
+    results_gen = Parallel(n_jobs=-1, batch_size=64, return_as='generator')(
+        delayed(_eval_pyccd_pixel)(*task) for task in pyccd_tasks
+    )
+
+    rec_idx = 0
+    for meta, models in zip(pyccd_meta, tqdm(results_gen, total=len(pyccd_tasks), desc="PyCCD pixels")):
+        (cond_idx, p_idx, m_id, m_name, f_weight, p_id, p_name, p_num, roff, coff, scene_r, scene_c) = meta
+
+        breaks = [m for m in models if m.get("change_probability", 0) > 0]
+        b_count = len(breaks)
+        post_onset_breaks = []
+
+        for m_idx_seg, m in enumerate(models, 1):
+            s_day = m.get("start_day")
+            e_day = m.get("end_day")
+            b_day = m.get("break_day")
+            has_b = (b_day is not None and b_day > 0 and m.get("change_probability", 0) > 0)
+
+            s_dt = datetime.date.fromordinal(s_day)
+            s_ts = datetime.datetime(s_dt.year, s_dt.month, s_dt.day, tzinfo=datetime.timezone.utc).timestamp()
+            e_dt = datetime.date.fromordinal(e_day)
+            e_ts = datetime.datetime(e_dt.year, e_dt.month, e_dt.day, tzinfo=datetime.timezone.utc).timestamp()
+
+            if has_b:
+                b_dt = datetime.date.fromordinal(b_day)
+                b_time = datetime.datetime(b_dt.year, b_dt.month, b_dt.day, tzinfo=datetime.timezone.utc).timestamp()
+                is_post = (b_day >= onset_ordinal)
+                lat_seg = float((b_time - onset_ts) / 86400.0) if is_post else np.nan
+                mags = m.get("magnitudes", [0.0])
+                mag_seg = float(np.linalg.norm(mags))
+                if is_post:
+                    post_onset_breaks.append((b_time, lat_seg, mag_seg))
+            else:
+                b_time = np.nan
+                is_post = False
+                lat_seg = np.nan
+                mag_seg = 0.0
+
+            seg_rec = np.zeros(1, dtype=SEGMENT_RECORD_DTYPE)[0]
+            seg_rec["condition_idx"] = cond_idx
+            seg_rec["material_id"] = m_id
+            seg_rec["material_name"] = m_name
+            seg_rec["mixture_fraction"] = f_weight
+            seg_rec["patch_id"] = p_id
+            seg_rec["patch_name"] = p_name
+            seg_rec["pixel_num"] = p_num
+            seg_rec["scene_row"] = scene_r
+            seg_rec["scene_col"] = scene_c
+            seg_rec["segment_num"] = m_idx_seg
+            seg_rec["start_timestamp"] = s_ts
+            seg_rec["end_timestamp"] = e_ts
+            seg_rec["has_break"] = has_b
+            seg_rec["break_num"] = m_idx_seg if has_b else 0
+            seg_rec["break_timestamp"] = b_time
+            seg_rec["confirmation_timestamp"] = b_time
+            seg_rec["is_post_onset"] = is_post
+            seg_rec["latency_days"] = lat_seg
+            seg_rec["confirmation_latency_days"] = lat_seg
+            seg_rec["break_magnitude"] = mag_seg
+            rmse_val = m.get("rmse", [0.0])
+            seg_rec["rmse"] = float(np.mean(rmse_val)) if hasattr(rmse_val, '__len__') else float(rmse_val)
+            seg_rec["num_observations"] = int(m.get("observation_count", 0))
+            pyccd_segment_list.append(seg_rec)
+
+        # Compare against baseline PyCCD evaluation (produced by pyccd_landsat_main.py)
+        base_count = int(baseline_pyccd["count"][p_idx, roff, coff])
+        base_date = float(baseline_pyccd["date"][p_idx, roff, coff])
+
+        n_post = len(post_onset_breaks)
+        has_mult = (n_post > 1)
+
+        if n_post > 0:
+            pri_b_ts, pri_lat, pri_mag = post_onset_breaks[0]
+            has_break_post_onset = (not np.isnan(pri_b_ts)) and (pri_b_ts >= onset_ts)
+            is_new_break = has_break_post_onset and (
+                (base_count == 0) or
+                np.isnan(base_date) or
+                (b_count > base_count) or
+                (pri_b_ts < base_date)
+            )
+            detected = is_new_break
+            break_ts = pri_b_ts if detected else np.nan
+            latency = pri_lat if detected else np.nan
+            mag = pri_mag if detected else 0.0
+        else:
+            detected = False
+            break_ts = np.nan
+            latency = np.nan
+            mag = 0.0
+
+        # Update the patch spatial arrays for the implanted pixel
+        pyccd_change_dates[cond_idx, p_idx, roff, coff] = break_ts if detected else np.nan
+        pyccd_change_counts[cond_idx, p_idx, roff, coff] = b_count
+
+        rec = results_table[rec_idx]
+        rec["condition_idx"] = cond_idx
+        rec["material_id"] = m_id
+        rec["material_name"] = m_name
+        rec["mixture_fraction"] = f_weight
+        rec["patch_id"] = p_id
+        rec["patch_name"] = p_name
+        rec["pixel_num"] = p_num
+        rec["scene_row"] = scene_r
+        rec["scene_col"] = scene_c
+        rec["break_detected"] = detected
+        rec["break_timestamp"] = break_ts
+        rec["latency_days"] = latency
+        rec["break_magnitude"] = mag
+        rec["p_value"] = 1.0 if detected else 0.0
+        rec["total_breaks"] = b_count
+        rec["post_onset_breaks"] = n_post
+        rec["has_multiple_post_breaks"] = has_mult
+        rec["confirmation_timestamp"] = break_ts
+        rec["confirmation_latency_days"] = latency
+
+        rec_idx += 1
 
     detected_count = np.sum(results_table["break_detected"])
     multiple_break_count = np.sum(results_table["has_multiple_post_breaks"])
@@ -1379,7 +1469,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HLSL30"].dtype,
         fillvalue=metadata["fill_values"]["HLSL30"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     l30_ds.attrs["scale_factor"] = metadata["scale_factors"]["HLSL30"]
     l30_ds.attrs["_FillValue"] = metadata["fill_values"]["HLSL30"]
@@ -1390,7 +1480,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HLSL30_Fmask"].dtype,
         fillvalue=metadata["mask_fill_values"]["HLSL30_Fmask"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     fm_l30_ds.attrs["_FillValue"] = metadata["mask_fill_values"]["HLSL30_Fmask"]
 
@@ -1400,7 +1490,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HLSL30_common_mask"].dtype,
         fillvalue=metadata["mask_fill_values"]["HLSL30_common_mask"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     cm_l30_ds.attrs["_FillValue"] = metadata["mask_fill_values"]["HLSL30_common_mask"]
 
@@ -1410,7 +1500,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HLSS30"].dtype,
         fillvalue=metadata["fill_values"]["HLSS30"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     s30_ds.attrs["scale_factor"] = metadata["scale_factors"]["HLSS30"]
     s30_ds.attrs["_FillValue"] = metadata["fill_values"]["HLSS30"]
@@ -1421,7 +1511,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HLSS30_Fmask"].dtype,
         fillvalue=metadata["mask_fill_values"]["HLSS30_Fmask"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     fm_s30_ds.attrs["_FillValue"] = metadata["mask_fill_values"]["HLSS30_Fmask"]
 
@@ -1431,7 +1521,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HLSS30_common_mask"].dtype,
         fillvalue=metadata["mask_fill_values"]["HLSS30_common_mask"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     cm_s30_ds.attrs["_FillValue"] = metadata["mask_fill_values"]["HLSS30_common_mask"]
 
@@ -1442,7 +1532,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
             dtype=chips["TANAGER"].dtype,
             fillvalue=metadata["fill_values"]["TANAGER"],
             compression="gzip",
-            compression_opts=6
+            compression_opts=1
         )
         tan_ds.attrs["scale_factor"] = metadata["scale_factors"]["TANAGER"]
         tan_ds.attrs["_FillValue"] = metadata["fill_values"]["TANAGER"]
@@ -1453,7 +1543,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HARMONIZED_common_mask"].dtype,
         fillvalue=metadata["mask_fill_values"]["HARMONIZED_common_mask"],
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     harm_cm_ds.attrs["_FillValue"] = metadata["mask_fill_values"]["HARMONIZED_common_mask"]
 
@@ -1463,7 +1553,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=chips["HARMONIZED_z_score"].dtype,
         fillvalue=np.nan,
         compression="gzip",
-        compression_opts=6
+        compression_opts=1
     )
     harm_z.attrs["_FillValue"] = np.nan
 
@@ -1472,26 +1562,26 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
             "scccd_baseline_change_date",
             data=chips["BASELINE_SCCCD"]["date"],
             compression="gzip",
-            compression_opts=6
+            compression_opts=1
         )
         base_chips_grp.create_dataset(
             "scccd_baseline_change_count",
             data=chips["BASELINE_SCCCD"]["count"],
             compression="gzip",
-            compression_opts=6
+            compression_opts=1
         )
     if "BASELINE_PYCCD" in chips:
         base_chips_grp.create_dataset(
             "pyccd_baseline_change_date",
             data=chips["BASELINE_PYCCD"]["date"],
             compression="gzip",
-            compression_opts=6
+            compression_opts=1
         )
         base_chips_grp.create_dataset(
             "pyccd_baseline_change_count",
             data=chips["BASELINE_PYCCD"]["count"],
             compression="gzip",
-            compression_opts=6
+            compression_opts=1
         )
 
     # 3. SIMULATED_CUBES Subgroup (Stored as native float32 with gzip level 6)
@@ -1502,7 +1592,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
         dtype=sim_z_cubes.dtype,
         fillvalue=np.nan,
         compression="gzip",
-        compression_opts=6,
+        compression_opts=1,
         chunks=(1, 1, min(sim_z_cubes.shape[2], 128), PATCH_SIZE, PATCH_SIZE),
     )
     sim_ds.attrs["_FillValue"] = np.nan
@@ -1523,7 +1613,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
                 f"scccd_{k}",
                 data=arr,
                 compression="gzip",
-                compression_opts=6,
+                compression_opts=1,
                 chunks=(1, 1, PATCH_SIZE, PATCH_SIZE),
             )
     if pyccd_spatial is not None:
@@ -1532,7 +1622,7 @@ def save_benchmark_to_hdf5(h5_file, chips, metadata, target_spectra, sim_z_cubes
                 f"pyccd_{k}",
                 data=arr,
                 compression="gzip",
-                compression_opts=6,
+                compression_opts=1,
                 chunks=(1, 1, PATCH_SIZE, PATCH_SIZE),
             )
 

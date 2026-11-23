@@ -128,12 +128,43 @@ def calcGramLocalVolumes(endmembers, localization_vector):
         
     return volumes
 
+def process_volume_sliding_tile_batch(batch_data, tile_size, stride, num_endmembers):
+    """
+    Batched sliding window processing across multiple spatial patch tiles on CPU.
+
+    Args:
+        batch_data: ndarray of shape (B, bands, height, width) or (bands, height, width).
+        tile_size: int, spatial window size (e.g., 3).
+        stride: int, sliding window stride.
+        num_endmembers: int, maximum number of endmembers to extract per tile.
+
+    Returns:
+        final_maps: ndarray of shape (B, height, width) or (height, width).
+    """
+    is_3d = (batch_data.ndim == 3)
+    if is_3d:
+        batch_data = batch_data[np.newaxis, ...]
+
+    B, bands, height, width = batch_data.shape
+    final_maps = np.zeros((B, height, width), dtype=np.float32)
+
+    for b in range(B):
+        final_maps[b] = process_volume_sliding_tile(batch_data[b], tile_size, stride, num_endmembers)
+
+    if is_3d:
+        return final_maps[0]
+    return final_maps
+
+
 def process_volume_sliding_tile(frame_data, tile_size, stride, num_endmembers):
     """
     Sliding window processing.
     Strict Validity: Window is only processed if ALL pixels are valid.
     Output is masked with NaN for any pixel identified as invalid.
     """
+    if hasattr(frame_data, "ndim") and frame_data.ndim == 4:
+        return process_volume_sliding_tile_batch(frame_data, tile_size, stride, num_endmembers)
+
     bands, height, width = frame_data.shape
     img = np.transpose(frame_data, (1, 2, 0))
     
@@ -182,6 +213,58 @@ def process_volume_sliding_tile(frame_data, tile_size, stride, num_endmembers):
         
     return final_map
 
+def calculate_global_z_score_batch(volume_array, valid_pixel_mask=None, array_mean=None, array_std=None):
+    """
+    Calculates global Z-scores across a batch of spectral complexity volume frames (B, H, W).
+
+    Args:
+        volume_array (np.ndarray): 3D array [batch, height, width] of spectral complexity volumes.
+        valid_pixel_mask (np.ndarray, optional): Boolean 2D or 3D mask of valid pixels.
+        array_mean (float or np.ndarray, optional): Pre-computed mean(s) (in log space).
+        array_std (float or np.ndarray, optional): Pre-computed standard deviation(s) (in log space).
+
+    Returns:
+        tuple: (z_scores, array_mean, array_std)
+            - z_scores (np.ndarray): 3D array [batch, height, width] of Z-scores.
+            - array_mean: Mean(s) used for normalization.
+            - array_std: Standard deviation(s) used for normalization.
+    """
+    B, height, width = volume_array.shape
+    z_scores = np.full((B, height, width), np.nan, dtype=np.float32)
+    global_valid_mask = volume_array > 0.0
+
+    if array_mean is not None and array_std is not None:
+        mean_arr = np.asarray(array_mean, dtype=np.float32)
+        std_arr = np.asarray(array_std, dtype=np.float32)
+
+        if mean_arr.ndim == 0:
+            mean_arr = np.full((B, 1, 1), float(mean_arr), dtype=np.float32)
+            std_arr = np.full((B, 1, 1), float(std_arr), dtype=np.float32)
+        elif mean_arr.ndim == 1:
+            mean_arr = mean_arr[:, np.newaxis, np.newaxis]
+            std_arr = std_arr[:, np.newaxis, np.newaxis]
+
+        if valid_pixel_mask is not None:
+            mask_val = np.asarray(valid_pixel_mask, dtype=bool)
+            if mask_val.ndim == 2:
+                mask = global_valid_mask & mask_val[np.newaxis, :, :]
+            else:
+                mask = global_valid_mask & mask_val
+        else:
+            mask = global_valid_mask
+
+        valid_eval = mask & (std_arr > 0) & (~np.isnan(mean_arr))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z_scores = np.where(valid_eval, (np.log(volume_array) - mean_arr) / std_arr, np.nan)
+
+        return z_scores, array_mean, array_std
+    else:
+        for b in range(B):
+            vm = valid_pixel_mask[b] if (valid_pixel_mask is not None and valid_pixel_mask.ndim == 3) else valid_pixel_mask
+            z_scores[b], _, _ = calculate_global_z_score(volume_array[b], valid_pixel_mask=vm)
+        return z_scores, np.nan, np.nan
+
+
 def calculate_global_z_score(volume_array, valid_pixel_mask=None, array_mean=None, array_std=None):
     """
     Calculates the global Z-score for an entire frame of spectral complexity volumes.
@@ -203,6 +286,10 @@ def calculate_global_z_score(volume_array, valid_pixel_mask=None, array_mean=Non
             - global_mean (float or np.ndarray): Mean used for normalization.
             - global_std (float or np.ndarray): Standard deviation used for normalization.
     """
+    # Support 3D batched inputs (B, height, width)
+    if hasattr(volume_array, "ndim") and volume_array.ndim == 3:
+        return calculate_global_z_score_batch(volume_array, valid_pixel_mask=valid_pixel_mask, array_mean=array_mean, array_std=array_std)
+
     height, width = volume_array.shape
     z_scores = np.full((height, width), np.nan, dtype=np.float32)
     
