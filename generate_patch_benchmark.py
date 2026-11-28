@@ -51,7 +51,7 @@ if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 # Import core modules
-import SpecComplexTorch as sc
+import SpecComplex as sc
 import SC_CCM_main as scccm
 import pyccd_landsat_main as pccd
 import ccd

@@ -60,7 +60,7 @@ LOCATION = "Rochesterv2"
 H5_PATH = f"C:/satelliteImagery/HLST30/HLST_{LOCATION}.h5"
 
 TARGET_METRIC = 'sliding_volume_z_score'
-TARGET_NAME, TARGET_SHORT_NAME, *_ = resolve_metric_naming(TARGET_METRIC)
+
 
 # Anomaly Detection Thresholds
 CHANGE_PROBABILITY = 0.99
@@ -150,7 +150,7 @@ def _resolve_metric_dataset(data_grp, target_metric, metric_key, is_inj):
         f"Available datasets: {list(data_grp.keys())}"
     )
 
-
+TARGET_NAME, TARGET_SHORT_NAME, *_ = resolve_metric_naming(TARGET_METRIC)
 # ==========================================
 # 3. MATHEMATICAL CORE FORMULATIONS
 # ==========================================
